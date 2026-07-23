@@ -29,11 +29,22 @@ Three independent RNG streams are seeded from TrainingConfig.seed:
     rng_data    batch shuffling
     rng_sample  sample generation (greedy by default, so unused)
 RNG states are serialized to logs/<run_id>/rng_state_epoch_<n>.json after
-each epoch so a run can be resumed with identical results.
+each epoch, and optimizer state is checkpointed alongside the model, so a run
+can be resumed and continue from where it stopped.
+
+Resume
+------
+Each fresh run() mints a unique run_id (a UUID) and records it in
+checkpoints/active_runs.json, keyed by model name.  A later run(resume=True)
+recovers that run_id and continues the SAME run — restoring model weights,
+optimizer state, and RNG state, and continuing epoch/checkpoint numbering.
+If no prior run is recorded, resume raises ResumeError rather than silently
+starting over.
 """
 
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -55,7 +66,7 @@ from .corpus import CorpusManager
 from .dashboard import TrainingDashboard
 from .metrics import MetricsCollector
 from .model_card import ModelCard
-from .resume import ResumeTraining
+from .resume import ResumeError, ResumeTraining
 from .sampler import SampleGenerator
 from .scheduler import SchedulerCallback, build_scheduler
 from .fingerprint import DatasetFingerprint
@@ -178,6 +189,56 @@ class TrainingProject:
         self._project = project
         self._config = config
 
+    # ── run-id registry ───────────────────────────────────────────────────────
+    # The active run_id for each model name is persisted so a later --resume can
+    # recover the exact run to continue.  Each fresh run still gets its own UUID;
+    # the registry only remembers which UUID is the latest per model.
+
+    def _run_registry_path(self) -> Path:
+        return self._project.dir("checkpoints") / "active_runs.json"
+
+    def _read_run_registry(self) -> dict:
+        path = self._run_registry_path()
+        if not path.is_file():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    def _record_run_id(self, run_id: str) -> None:
+        registry = self._read_run_registry()
+        registry[self._config.model_name] = run_id
+        path = self._run_registry_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(registry, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _recover_run_id(self) -> str | None:
+        return self._read_run_registry().get(self._config.model_name)
+
+    @staticmethod
+    def _history_from_records(records: list[dict]) -> dict:
+        """Rebuild per-epoch metric lists from prior metrics.jsonl epoch records
+        so a resumed run's returned history spans the full run."""
+        loss, vloss, vppl, tps, gnorm = [], [], [], [], []
+        for r in sorted(records, key=lambda x: x.get("epoch", 0)):
+            if r.get("mean_loss") is not None:
+                loss.append(r["mean_loss"])
+            if r.get("val_loss") is not None:
+                vloss.append(r["val_loss"])
+            if r.get("perplexity") is not None:
+                vppl.append(r["perplexity"])
+            if r.get("tokens_per_sec") is not None:
+                tps.append(r["tokens_per_sec"])
+            gnorm.append(r.get("grad_norm") or 0.0)
+        return {
+            "loss_history": loss,
+            "val_loss_history": vloss,
+            "val_perplexity_history": vppl,
+            "tokens_per_sec": tps,
+            "grad_norm_history": gnorm,
+        }
+
     def run(
         self,
         *,
@@ -198,8 +259,20 @@ class TrainingProject:
         cfg = self._config
         cfg.validate()
 
-        run_id = f"run_{uuid.uuid4().hex[:12]}"
         project = self._project
+
+        # ── run id (persisted so --resume recovers the same run) ───────────────
+        if resume:
+            run_id = self._recover_run_id()
+            if run_id is None:
+                raise ResumeError(
+                    f"--resume requested but no previous run is recorded for model "
+                    f"{cfg.model_name!r} in project {project.id!r}. "
+                    f"Start a fresh run first (run without --resume)."
+                )
+        else:
+            run_id = f"run_{uuid.uuid4().hex[:12]}"
+            self._record_run_id(run_id)
 
         # ── directories ───────────────────────────────────────────────────────
         logs_dir = project.logs_dir() / run_id
@@ -217,9 +290,11 @@ class TrainingProject:
         tok_manifest = ts.open_manifest(cfg.tokenizer_id)
         tokenizer = ts.load(cfg.tokenizer_id)
         tok_fp = tok_manifest.get("vocabulary_fingerprint", "")
-        eos_id = tokenizer.vocab_size - 1  # BPE: last token is <eos>
+        eos_id = tokenizer.eos_id  # public accessor — do not assume a physical id
 
         # ── corpus ────────────────────────────────────────────────────────────
+        # Documents are shuffled deterministically (seed = cfg.seed) before the
+        # train/val split so validation is a representative mix of sources.
         corpus_mgr = CorpusManager(project.data_dir(), project.cache_dir())
         corpus = corpus_mgr.build(
             cfg.dataset_ids,
@@ -228,6 +303,7 @@ class TrainingProject:
             tokenizer_fingerprint=tok_fp,
             eos_id=eos_id,
             split=cfg.train_split,
+            shuffle_seed=cfg.seed,
             progress_fn=progress_fn,
         )
 
@@ -300,18 +376,30 @@ class TrainingProject:
 
         # ── resume ────────────────────────────────────────────────────────────
         start_epoch = 0
+        start_step = 0
+        prior_history: dict | None = None
         if resume:
             resumer = ResumeTraining(ckpt_mgr, logs_dir)
-            if resumer.can_resume():
-                state = resumer.restore(model, optimizer)
-                start_epoch = state.start_epoch
-                if state.rng_states:
-                    ResumeTraining.restore_rng_state(
-                        state.rng_states, rng_model, rng_data, rng_sample,
-                    )
+            if not resumer.can_resume():
+                raise ResumeError(
+                    f"--resume requested but run {run_id!r} for model {cfg.model_name!r} "
+                    f"has no saved checkpoints to resume from."
+                )
+            state = resumer.restore(model, optimizer)
+            start_epoch = state.start_epoch
+            start_step = state.start_step
+            if state.rng_states:
+                ResumeTraining.restore_rng_state(
+                    state.rng_states, rng_model, rng_data, rng_sample,
+                )
+            prior_history = self._history_from_records(state.metrics_history)
+            if start_epoch >= cfg.epochs:
+                raise ResumeError(
+                    f"run {run_id!r} already completed {start_epoch} epoch(s), which meets "
+                    f"the configured epochs={cfg.epochs}. Increase epochs to continue training."
+                )
 
         # ── write config snapshot ─────────────────────────────────────────────
-        import json
         config_path = logs_dir / "config.json"
         config_path.write_text(
             json.dumps(cfg.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
@@ -330,6 +418,10 @@ class TrainingProject:
             epochs=remaining_epochs,
             val_sampler=val_sampler,
             seed=seed,
+            start_epoch=start_epoch,
+            start_step=start_step,
+            total_epochs=cfg.epochs,
+            history=prior_history,
         )
 
         # ── save model ────────────────────────────────────────────────────────

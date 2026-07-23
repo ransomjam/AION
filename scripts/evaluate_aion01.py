@@ -71,8 +71,12 @@ def main() -> None:
         print(f"Using most recent model: {model_id}")
 
     manifest = gpt_store.open_manifest(model_id)
+    _cfg = manifest.get("config", {})
+    _arch = (f"{manifest['architecture']} — d_model={_cfg.get('d_model')}, "
+             f"n_heads={_cfg.get('n_heads')}, n_layers={_cfg.get('n_layers')}, "
+             f"d_ff={_cfg.get('d_ff')}")
     print(f"Model: {manifest['name']} ({model_id})")
-    print(f"  Architecture: {manifest['architecture']}")
+    print(f"  Architecture: {_arch}")
     print(f"  Parameters:   {manifest['param_count']:,}")
     print(f"  Created:      {manifest['created_at']}")
 
@@ -97,14 +101,17 @@ def main() -> None:
     ds_store = DatasetStore(project.data_dir())
     ds = ds_store.open(DATASET_NAME)
     tok_fp = tok_manifest.get("vocabulary_fingerprint", "")
-    eos_id = tokenizer.vocab_size - 1
+    eos_id = tokenizer.eos_id  # public accessor — matches training
 
-    # Retrieve training config from model manifest to use same split/context
+    # Retrieve training config from model manifest to use same split/context/seed
     training_config = manifest.get("params", {}).get("training_config", {})
     context_length = training_config.get("context_length", 256)
     train_split = training_config.get("train_split", 0.9)
     batch_size = training_config.get("batch_size", 8)
+    shuffle_seed = training_config.get("seed", 42)
 
+    # Rebuild with the SAME eos, split, and shuffle seed as training so this hits
+    # the cached corpus and evaluates the identical validation set.
     corpus_mgr = CorpusManager(project.data_dir(), project.cache_dir())
     corpus = corpus_mgr.build(
         [ds.id],
@@ -113,6 +120,7 @@ def main() -> None:
         tokenizer_fingerprint=tok_fp,
         eos_id=eos_id,
         split=train_split,
+        shuffle_seed=shuffle_seed,
     )
     print(f"  Train tokens: {len(corpus.train_tokens):,}")
     print(f"  Val tokens:   {len(corpus.val_tokens):,}")

@@ -1,8 +1,10 @@
 """ResumeTraining — restore a training run from a checkpoint.
 
-Restores model weights from the latest checkpoint and returns the epoch
-to resume from.  RNG state is serialized to JSON alongside each checkpoint
-so a resumed run produces identical results to an uninterrupted run.
+Restores model weights, optimizer state (moment buffers + step counter), and
+RNG state from the latest checkpoint, and returns the epoch/step to resume
+from.  RNG state is serialized to JSON alongside each checkpoint; together with
+the restored optimizer state this lets a resumed run continue as if it had
+never stopped.
 """
 
 from __future__ import annotations
@@ -14,6 +16,10 @@ from pathlib import Path
 import numpy as np
 
 from .checkpoint import CheckpointManager
+
+
+class ResumeError(Exception):
+    """Raised when ``--resume`` is requested but no resumable run exists."""
 
 
 @dataclass
@@ -56,10 +62,11 @@ class ResumeTraining:
         model:
             ``GPTModel`` instance to restore weights into.
         optimizer:
-            Optional optimizer.  Not restored (Adam moment buffers are not
-            checkpointed in this milestone).
+            Optional optimizer.  When given, its moment buffers and step
+            counter are restored from the checkpoint so training continues
+            with the exact optimizer state it had before stopping.
         """
-        meta = self.manager.load_latest(model)
+        meta = self.manager.load_latest(model, optimizer=optimizer)
         if meta is None:
             return ResumeState(start_epoch=0, start_step=0)
 

@@ -98,5 +98,30 @@ class Tokenizer(ABC):
         """Number of tokens in the vocabulary (including specials)."""
         raise NotImplementedError
 
+    # ── special token ids ─────────────────────────────────────────────────────
+    # Public accessors for the four reserved special tokens.  Callers must use
+    # these instead of guessing ids (e.g. ``vocab_size - 1``); the physical id
+    # of a special token is an implementation detail of each algorithm.
+
+    @property
+    def pad_id(self) -> int:
+        """Token id for the padding token."""
+        raise NotImplementedError
+
+    @property
+    def unk_id(self) -> int:
+        """Token id for the unknown token."""
+        raise NotImplementedError
+
+    @property
+    def bos_id(self) -> int:
+        """Token id for the beginning-of-sequence token."""
+        raise NotImplementedError
+
+    @property
+    def eos_id(self) -> int:
+        """Token id for the end-of-sequence token."""
+        raise NotImplementedError
+
     def __repr__(self) -> str:
         return f"{type(self).__name__}(algorithm={self.algorithm!r}, vocab_size={self.vocab_size})"

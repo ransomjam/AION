@@ -22,7 +22,8 @@ Thumbs.db
 
 # AION workspace — project data lives here; it is data, not code.
 # Override the location with AION_WORKSPACE.
-workspace/
+# Anchored to the repo root so it never matches the aion/workspace source package.
+/workspace/
 
 # Local machine config
 local.properties

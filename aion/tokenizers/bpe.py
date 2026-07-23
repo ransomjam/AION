@@ -163,6 +163,14 @@ class ByteLevelBPETokenizer(Tokenizer):
             for word in tokenize(normalize(doc), normalize_first=False):
                 raw_freq[word] += 1
 
+        # Fail early on an empty corpus rather than emitting a degenerate
+        # tokenizer that has learned no merges.
+        if not raw_freq:
+            raise ValueError(
+                "tokenizer training received no text: the corpus is empty. "
+                "Prepare a non-empty dataset before training the tokenizer."
+            )
+
         # Represent each word as a byte-symbol tuple
         word_freq: dict[tuple, int] = {
             _word_to_bytes(word): freq for word, freq in raw_freq.items()
@@ -319,3 +327,24 @@ class ByteLevelBPETokenizer(Tokenizer):
     @property
     def vocab_size(self) -> int:
         return len(self._vocab)
+
+    # ── special token ids ─────────────────────────────────────────────────────
+    # The four specials occupy fixed ids 0-3 (see ``_SPECIALS``).  Resolve them
+    # through ``_token_to_id`` so the ids stay correct even if the layout ever
+    # changes, with the fixed positions as the fallback before training.
+
+    @property
+    def pad_id(self) -> int:
+        return self._token_to_id.get(_PAD, 0)
+
+    @property
+    def unk_id(self) -> int:
+        return self._token_to_id.get(_UNK, 1)
+
+    @property
+    def bos_id(self) -> int:
+        return self._token_to_id.get(_BOS, 2)
+
+    @property
+    def eos_id(self) -> int:
+        return self._token_to_id.get(_EOS, 3)

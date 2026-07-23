@@ -39,7 +39,10 @@ class GPTCheckpoint:
         self.run_dir = Path(checkpoints_dir) / run_id
         self.run_dir.mkdir(parents=True, exist_ok=True)
 
-    def save(self, model, epoch: int, metrics: dict) -> Path:
+    def _optim_path(self, epoch: int) -> Path:
+        return self.run_dir / f"optim_{epoch}.npz"
+
+    def save(self, model, epoch: int, metrics: dict, optimizer=None) -> Path:
         """Save model parameters and epoch metadata.
 
         Parameters
@@ -50,6 +53,10 @@ class GPTCheckpoint:
             Current epoch number (1-based).
         metrics:
             Dict of scalar metrics to record (loss, val_loss, etc.).
+        optimizer:
+            Optional optimizer whose state (moment buffers + step counter) is
+            saved to ``optim_<epoch>.npz`` and whose scalars are recorded in the
+            metadata under ``"optimizer"`` so training can resume seamlessly.
 
         Returns
         -------
@@ -60,10 +67,20 @@ class GPTCheckpoint:
         npz_path = self.run_dir / f"checkpoint_{epoch}.npz"
         np.savez_compressed(str(npz_path), **arrays)
 
+        optimizer_scalars = None
+        if optimizer is not None:
+            optimizer_scalars = optimizer.state_dict()
+            moment_arrays = optimizer.moment_arrays()
+            # np.savez requires at least one array; skip the file if there is no
+            # buffered state yet (e.g. an optimizer that has not stepped).
+            if moment_arrays:
+                np.savez_compressed(str(self._optim_path(epoch)), **moment_arrays)
+
         meta = {
             "epoch": epoch,
             "param_keys": [_param_key(i, p) for i, p in enumerate(params)],
             "metrics": metrics,
+            "optimizer": optimizer_scalars,
             "saved_at": now_iso(),
         }
         (self.run_dir / f"checkpoint_{epoch}.json").write_text(
@@ -71,8 +88,8 @@ class GPTCheckpoint:
         )
         return npz_path
 
-    def load(self, model, epoch: int) -> dict:
-        """Restore model parameters from a checkpoint.
+    def load(self, model, epoch: int, optimizer=None) -> dict:
+        """Restore model parameters (and optionally optimizer state).
 
         Parameters
         ----------
@@ -80,6 +97,8 @@ class GPTCheckpoint:
             ``GPTModel`` instance with the same architecture as when saved.
         epoch:
             Epoch number to restore.
+        optimizer:
+            Optional optimizer to restore in place from the saved state.
 
         Returns
         -------
@@ -97,6 +116,11 @@ class GPTCheckpoint:
             key = param_keys[i] if i < len(param_keys) else _param_key(i, p)
             if key in weights:
                 p.data = weights[key].astype(np.float64)
+
+        if optimizer is not None and meta.get("optimizer") is not None:
+            optim_path = self._optim_path(epoch)
+            moment_arrays = dict(np.load(str(optim_path))) if optim_path.is_file() else {}
+            optimizer.load_state_dict(meta["optimizer"], moment_arrays)
         return meta
 
     def latest_epoch(self) -> int | None:

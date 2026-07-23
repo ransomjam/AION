@@ -85,6 +85,8 @@ class CorpusManager:
         eos_id: int,
         split: float = 0.9,
         max_documents: int | None = None,
+        shuffle_seed: int | None = None,
+        min_documents: int = 1,
         progress_fn=None,
     ) -> CorpusResult:
         """Build (or load from cache) the packed corpus.
@@ -103,6 +105,12 @@ class CorpusManager:
             Fraction of tokens used for training (remainder for validation).
         max_documents:
             Cap on total documents across all datasets.  None = no cap.
+        shuffle_seed:
+            If set, documents are shuffled deterministically with this seed
+            before packing, so the train/val split does not simply take the
+            final source in dataset order.  ``None`` preserves source order.
+        min_documents:
+            Minimum number of documents required; fewer raises ``ValueError``.
         progress_fn:
             Optional ``progress_fn(fraction, message)`` callback.
         """
@@ -120,6 +128,7 @@ class CorpusManager:
             eos_id=eos_id,
             split=split,
             max_documents=max_documents,
+            shuffle_seed=shuffle_seed,
         )
 
         # Check cache
@@ -127,18 +136,33 @@ class CorpusManager:
         if cached is not None:
             return cached
 
-        # Build corpus
-        all_doc_tokens: list[list[int]] = []
-        n_loaded = 0
+        # Collect documents (source order), then optionally shuffle at the
+        # document level.  Shuffling happens BEFORE tokenization/packing so the
+        # validation tail is a representative mix of sources, not the last one.
+        doc_texts: list[str] = []
         for ds_id in dataset_ids:
             ds = self._store.open(ds_id)
             for _, text in ds.stream():
-                if max_documents is not None and n_loaded >= max_documents:
+                if max_documents is not None and len(doc_texts) >= max_documents:
                     break
-                all_doc_tokens.append(tokenizer.encode(text))
-                n_loaded += 1
-                if progress_fn and n_loaded % 100 == 0:
-                    progress_fn(0.0, f"tokenized {n_loaded} documents")
+                doc_texts.append(text)
+
+        if len(doc_texts) < max(1, min_documents):
+            raise ValueError(
+                f"corpus has too few documents: found {len(doc_texts)}, "
+                f"need at least {max(1, min_documents)}. Prepare more data before training."
+            )
+
+        if shuffle_seed is not None:
+            rng = np.random.default_rng(shuffle_seed)
+            order = rng.permutation(len(doc_texts))
+            doc_texts = [doc_texts[i] for i in order]
+
+        all_doc_tokens: list[list[int]] = []
+        for text in doc_texts:
+            all_doc_tokens.append(tokenizer.encode(text))
+            if progress_fn and len(all_doc_tokens) % 100 == 0:
+                progress_fn(0.0, f"tokenized {len(all_doc_tokens)} documents")
 
         if not all_doc_tokens:
             raise ValueError("corpus is empty — no documents found in the given datasets")
@@ -207,6 +231,7 @@ class CorpusManager:
                 eos_id=fp_data["eos_id"],
                 split=fp_data["split"],
                 max_documents=fp_data["max_documents"],
+                shuffle_seed=fp_data.get("shuffle_seed"),
                 combined=fp_data["combined"],
             )
             stats_d = meta["stats"]

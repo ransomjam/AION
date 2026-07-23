@@ -46,13 +46,15 @@ class CheckpointManager:
         self._best_val_loss: float = float("inf")
         self._manifest_path = self.run_dir / "manifest.json"
 
-    def save(self, model, epoch: int, metrics: dict) -> Path:
+    def save(self, model, epoch: int, metrics: dict, optimizer=None) -> Path:
         """Save a checkpoint and update the manifest.
 
-        If ``metrics`` contains ``val_loss`` and it is the best seen so far,
-        also copies the checkpoint to ``best/``.
+        If ``optimizer`` is given, its state is checkpointed alongside the model
+        so a resumed run continues from the exact optimizer state.  If
+        ``metrics`` contains ``val_loss`` and it is the best seen so far, the
+        checkpoint is also copied to ``best/``.
         """
-        path = self._ckpt.save(model, epoch, metrics)
+        path = self._ckpt.save(model, epoch, metrics, optimizer=optimizer)
         self._update_manifest(epoch, metrics, str(path))
         self.prune()
 
@@ -63,12 +65,15 @@ class CheckpointManager:
 
         return path
 
-    def load_latest(self, model) -> dict | None:
-        """Load the most recent checkpoint into model.  Returns metadata or None."""
+    def load_latest(self, model, optimizer=None) -> dict | None:
+        """Load the most recent checkpoint into model.  Returns metadata or None.
+
+        If ``optimizer`` is given, its state is restored too.
+        """
         epoch = self._ckpt.latest_epoch()
         if epoch is None:
             return None
-        return self._ckpt.load(model, epoch)
+        return self._ckpt.load(model, epoch, optimizer=optimizer)
 
     def load_best(self, model) -> dict | None:
         """Load the best (lowest val_loss) checkpoint into model."""
@@ -115,6 +120,9 @@ class CheckpointManager:
                 p = self.run_dir / f"checkpoint_{epoch}{suffix}"
                 if p.is_file():
                     p.unlink()
+            optim_p = self.run_dir / f"optim_{epoch}.npz"
+            if optim_p.is_file():
+                optim_p.unlink()
 
     # ── internal ──────────────────────────────────────────────────────────────
 
@@ -140,6 +148,9 @@ class CheckpointManager:
             src = self.run_dir / f"checkpoint_{epoch}{suffix}"
             if src.is_file():
                 shutil.copy2(src, best_dir / f"checkpoint_{epoch}{suffix}")
+        optim_src = self.run_dir / f"optim_{epoch}.npz"
+        if optim_src.is_file():
+            shutil.copy2(optim_src, best_dir / f"optim_{epoch}.npz")
         meta_path = self.run_dir / f"checkpoint_{epoch}.json"
         if meta_path.is_file():
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -167,4 +178,7 @@ class CheckpointCallback(TrainingCallback):
                 for k in ("mean_loss", "val_loss", "val_perplexity", "global_step")
                 if k in context
             }
-            self.manager.save(trainer.model, epoch + 1, metrics)
+            self.manager.save(
+                trainer.model, epoch + 1, metrics,
+                optimizer=getattr(trainer, "optimizer", None),
+            )

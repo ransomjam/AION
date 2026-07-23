@@ -41,6 +41,7 @@ from aion.tokenizers.store import TokenizerStore
 from aion.workspace.store import ProjectStore
 from aion.training.config import TrainingConfig
 from aion.training.project import TrainingProject
+from aion.training.resume import ResumeError
 
 PROJECT_NAME = "aion-01"
 DATASET_NAME = "aion-corpus"
@@ -153,7 +154,11 @@ def main() -> None:
     t0 = time.monotonic()
 
     print("Starting training...\n")
-    run_result = tp.run(resume=resume, progress_fn=_progress)
+    try:
+        run_result = tp.run(resume=resume, progress_fn=_progress)
+    except ResumeError as exc:
+        print(f"\nERROR: {exc}")
+        sys.exit(1)
     print()  # newline after final progress bar
 
     elapsed = time.monotonic() - t0

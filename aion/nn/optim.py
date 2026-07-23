@@ -47,6 +47,26 @@ class Optimizer(ABC):
         for p in self.parameters:
             p.zero_grad()
 
+    # ── checkpointing ──────────────────────────────────────────────────────────
+    # State is split into JSON-serializable scalars (``state_dict``) and NumPy
+    # buffers (``moment_arrays``) so a checkpoint can persist scalars in its
+    # metadata and buffers in an ``.npz`` alongside the model weights.  Buffers
+    # are keyed by PARAMETER INDEX (not ``id(p)``, which is not stable across
+    # processes) so they re-bind correctly to a freshly constructed optimizer.
+
+    def state_dict(self) -> dict:
+        """Return JSON-serializable optimizer scalars."""
+        return {"type": "optimizer", "lr": self.lr}
+
+    def moment_arrays(self) -> dict[str, np.ndarray]:
+        """Return per-parameter NumPy state buffers, keyed for ``.npz`` storage."""
+        return {}
+
+    def load_state_dict(self, scalars: dict, arrays: dict) -> None:
+        """Restore optimizer state from ``state_dict`` scalars and buffers."""
+        if "lr" in scalars:
+            self.lr = scalars["lr"]
+
 
 class SGD(Optimizer):
     """Stochastic gradient descent with optional momentum.
@@ -78,6 +98,24 @@ class SGD(Optimizer):
         self.momentum = momentum
         # Per-parameter velocity buffers, initialised lazily.
         self._velocity: dict[int, np.ndarray] = {}
+
+    def state_dict(self) -> dict:
+        return {"type": "sgd", "lr": self.lr, "momentum": self.momentum}
+
+    def moment_arrays(self) -> dict[str, np.ndarray]:
+        idx = {id(p): i for i, p in enumerate(self.parameters)}
+        return {f"vel_{idx[pid]}": v for pid, v in self._velocity.items()}
+
+    def load_state_dict(self, scalars: dict, arrays: dict) -> None:
+        if "lr" in scalars:
+            self.lr = scalars["lr"]
+        if "momentum" in scalars:
+            self.momentum = scalars["momentum"]
+        self._velocity = {}
+        for i, p in enumerate(self.parameters):
+            key = f"vel_{i}"
+            if key in arrays:
+                self._velocity[id(p)] = np.asarray(arrays[key])
 
     def step(self) -> None:
         for p in self.parameters:
@@ -133,6 +171,37 @@ class Adam(Optimizer):
         self._m: dict[int, np.ndarray] = {}   # first moment
         self._v: dict[int, np.ndarray] = {}   # second moment
         self._t: int = 0                       # step counter
+
+    def state_dict(self) -> dict:
+        return {
+            "type": "adam", "lr": self.lr, "beta1": self.beta1,
+            "beta2": self.beta2, "eps": self.eps, "t": self._t,
+        }
+
+    def moment_arrays(self) -> dict[str, np.ndarray]:
+        idx = {id(p): i for i, p in enumerate(self.parameters)}
+        arrays: dict[str, np.ndarray] = {}
+        for pid, m in self._m.items():
+            arrays[f"m_{idx[pid]}"] = m
+        for pid, v in self._v.items():
+            arrays[f"v_{idx[pid]}"] = v
+        return arrays
+
+    def load_state_dict(self, scalars: dict, arrays: dict) -> None:
+        if "lr" in scalars:
+            self.lr = scalars["lr"]
+        self.beta1 = scalars.get("beta1", self.beta1)
+        self.beta2 = scalars.get("beta2", self.beta2)
+        self.eps = scalars.get("eps", self.eps)
+        self._t = int(scalars.get("t", 0))
+        self._m = {}
+        self._v = {}
+        for i, p in enumerate(self.parameters):
+            mk, vk = f"m_{i}", f"v_{i}"
+            if mk in arrays:
+                self._m[id(p)] = np.asarray(arrays[mk])
+            if vk in arrays:
+                self._v[id(p)] = np.asarray(arrays[vk])
 
     def step(self) -> None:
         self._t += 1

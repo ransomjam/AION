@@ -24,6 +24,7 @@ class DatasetFingerprint:
     eos_id: int
     split: float
     max_documents: int | None
+    shuffle_seed: int | None = None   # document-shuffle seed (None = source order)
     combined: str = ""                # computed; set by build()
 
     @classmethod
@@ -36,8 +37,9 @@ class DatasetFingerprint:
         eos_id: int,
         split: float,
         max_documents: int | None,
+        shuffle_seed: int | None = None,
     ) -> "DatasetFingerprint":
-        combined = _fp(
+        hash_args = [
             dataset_ids,
             dataset_fingerprints,
             tokenizer_id,
@@ -45,7 +47,13 @@ class DatasetFingerprint:
             eos_id,
             split,
             max_documents,
-        )
+        ]
+        # Only fold the shuffle seed into the hash when it is set, so unshuffled
+        # builds keep the exact fingerprint they had before this field existed
+        # (backward compatibility with pre-existing caches and fingerprints).
+        if shuffle_seed is not None:
+            hash_args.append(("shuffle_seed", shuffle_seed))
+        combined = _fp(*hash_args)
         return cls(
             dataset_ids=dataset_ids,
             dataset_fingerprints=dataset_fingerprints,
@@ -54,6 +62,7 @@ class DatasetFingerprint:
             eos_id=eos_id,
             split=split,
             max_documents=max_documents,
+            shuffle_seed=shuffle_seed,
             combined=combined,
         )
 
@@ -66,5 +75,6 @@ class DatasetFingerprint:
             "eos_id": self.eos_id,
             "split": self.split,
             "max_documents": self.max_documents,
+            "shuffle_seed": self.shuffle_seed,
             "combined": self.combined,
         }

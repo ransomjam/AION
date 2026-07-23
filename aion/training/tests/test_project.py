@@ -22,6 +22,11 @@ from aion.workspace.store import ProjectStore
 class _FakeTokenizer:
     algorithm = "bpe-byte-v1"
     vocab_size = 64
+    # Special tokens occupy the fixed low ids 0-3, matching the real tokenizer.
+    pad_id = 0
+    unk_id = 1
+    bos_id = 2
+    eos_id = 3
 
     def encode(self, text: str) -> list[int]:
         return [ord(c) % self.vocab_size for c in text]

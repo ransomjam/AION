@@ -54,10 +54,10 @@ from aion.workspace.store import ProjectStore
 PROJECT_NAME = "aion-01"
 DATASET_NAME = "aion-corpus"
 
-# Target: ~5M training tokens.  At ~250 chars/token average for BPE-8k on
-# English prose, we need ~1.25B characters.  With ~50k chars/document average
-# for Gutenberg books, ~250 books gives ~12.5M chars → ~50k tokens/book →
-# ~12.5M tokens total.  We cap at TARGET_DOCUMENTS to keep runtime manageable.
+# Target: a few million training tokens.  At ~4 chars/token average for BPE-8k
+# on English prose, ~50k chars/document for Gutenberg books gives ~12.5k
+# tokens/book.  A few hundred documents therefore yields several million tokens.
+# We cap at TARGET_DOCUMENTS to keep runtime manageable.
 
 TARGET_DOCUMENTS = 300          # total documents across all sources
 MIN_DOC_CHARS = 200             # discard shorter documents
@@ -100,8 +100,7 @@ GUTENBERG_IDS = [
     514,    # Little Women — Alcott
     1952,   # The Yellow Wallpaper — Gilman
     219,    # Heart of Darkness — Conrad
-    526,    # The Time Machine — Wells
-    35,     # The Time Machine (alt) — Wells
+    35,     # The Time Machine — Wells
     36,     # The War of the Worlds — Wells
     5230,   # The Island of Doctor Moreau — Wells
     768,    # Wuthering Heights — Brontë
@@ -120,7 +119,6 @@ GUTENBERG_IDS = [
     1257,   # The Jungle — Sinclair
     2148,   # Twenty Thousand Leagues Under the Sea — Verne
     103,    # Around the World in Eighty Days — Verne
-    164,    # Twenty Thousand Leagues (alt) — Verne
 ]
 
 # Wikipedia Simple English article titles — clean, factual, varied
@@ -157,7 +155,7 @@ WIKIPEDIA_TITLES = [
     "Piano", "Guitar", "Orchestra", "Opera", "Jazz",
     "Painting", "Sculpture", "Architecture", "Photography", "Film",
     "Trade", "Money", "Bank", "Market", "Inflation",
-    "Democracy", "Monarchy", "Republic", "Constitution", "Parliament",
+    "Monarchy", "Republic", "Constitution", "Parliament",
     "United Nations", "European Union", "NATO", "World Trade Organization",
     "Vaccine", "Antibiotic", "Surgery", "Epidemic", "Nutrition",
     "Electricity", "Magnetism", "Nuclear energy", "Solar energy", "Wind energy",
@@ -406,6 +404,17 @@ def main() -> None:
         imported += 1
         print(f"ok ({len(cleaned):,} chars)")
         time.sleep(0.3)
+
+    # ── Fail early on an empty corpus ─────────────────────────────────────────
+    # If every fetch failed (e.g. no network) the dataset would be empty and the
+    # downstream tokenizer/training steps would produce garbage or crash later.
+    if ds.meta["document_count"] == 0:
+        print(
+            "\nERROR: corpus is empty — no documents were imported "
+            f"(fetch failures: {skipped_fetch}). "
+            "Check network access to Gutenberg/Wikipedia and retry."
+        )
+        sys.exit(1)
 
     # ── Summary ───────────────────────────────────────────────────────────────
     total_chars = sum(len(text) for _, text in ds.stream())

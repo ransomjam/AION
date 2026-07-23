@@ -179,6 +179,10 @@ class GPTTrainer:
         epochs: int,
         val_sampler=None,
         seed: int = 0,
+        start_epoch: int = 0,
+        start_step: int = 0,
+        total_epochs: int | None = None,
+        history: dict | None = None,
     ) -> GPTTrainingResult:
         """Run the full training loop.
 
@@ -188,22 +192,39 @@ class GPTTrainer:
             Iterable (or callable returning iterable) of ``(x, y)`` integer
             array pairs.  If callable, called once per epoch for reshuffling.
         epochs:
-            Number of full passes over the training data.
+            Number of epochs to run in THIS call (the remaining epochs when
+            resuming).
         val_sampler:
             Optional iterable of ``(x, y)`` pairs for validation.  Evaluated
             after each training epoch.  Not reshuffled between epochs.
         seed:
             Recorded in the result for reproducibility.
+        start_epoch:
+            0-based epoch offset for a resumed run.  Epoch labels, checkpoint
+            numbers, and RNG-state files continue from here instead of restarting
+            at 0.
+        start_step:
+            Initial global step for a resumed run so the LR schedule and step
+            counter continue instead of restarting warmup.
+        total_epochs:
+            Total epochs across the whole run (used for the scheduler's
+            ``total_steps`` denominator and progress).  Defaults to
+            ``start_epoch + epochs``.
+        history:
+            Optional prior per-epoch metric lists to prepend so the returned
+            history spans the full run, not just the resumed epochs.
         """
         t_total = time.monotonic()
+        total_epochs = total_epochs if total_epochs is not None else start_epoch + epochs
 
-        loss_history: list[float] = []
-        val_loss_history: list[float] = []
-        val_perplexity_history: list[float] = []
-        grad_norm_history: list[float] = []
-        tokens_per_sec_history: list[float] = []
+        history = history or {}
+        loss_history: list[float] = list(history.get("loss_history", []))
+        val_loss_history: list[float] = list(history.get("val_loss_history", []))
+        val_perplexity_history: list[float] = list(history.get("val_perplexity_history", []))
+        grad_norm_history: list[float] = list(history.get("grad_norm_history", []))
+        tokens_per_sec_history: list[float] = list(history.get("tokens_per_sec", []))
         total_tokens = 0
-        global_step = 0
+        global_step = start_step
 
         # Estimate total steps for scheduler callbacks (best-effort).
         # Samplers may not have __len__; fall back to 0 (unknown).
@@ -212,13 +233,13 @@ class GPTTrainer:
                 else len(train_sampler())
         except Exception:
             steps_per_epoch = 0
-        total_steps = epochs * steps_per_epoch
+        total_steps = total_epochs * steps_per_epoch
 
         self._callbacks.on_train_begin(self, {
-            "epochs": epochs, "total_steps": total_steps, "seed": seed,
+            "epochs": total_epochs, "total_steps": total_steps, "seed": seed,
         })
 
-        for epoch in range(epochs):
+        for epoch in range(start_epoch, start_epoch + epochs):
             self.model.train()
             t_epoch = time.monotonic()
             epoch_loss = 0.0
@@ -226,7 +247,7 @@ class GPTTrainer:
             n_batches = 0
             epoch_tokens = 0
 
-            self._callbacks.on_epoch_begin(self, {"epoch": epoch, "epochs": epochs})
+            self._callbacks.on_epoch_begin(self, {"epoch": epoch, "epochs": total_epochs})
 
             batches = train_sampler() if callable(train_sampler) else train_sampler
             for x_ids, y_ids in batches:
@@ -282,7 +303,7 @@ class GPTTrainer:
 
             self._callbacks.on_epoch_end(self, {
                 "epoch": epoch,
-                "epochs": epochs,
+                "epochs": total_epochs,
                 "mean_loss": mean_loss,
                 "val_loss": val_loss,
                 "val_perplexity": val_ppl,
@@ -292,10 +313,10 @@ class GPTTrainer:
             })
 
             if self.progress_fn:
-                msg = f"epoch {epoch + 1}/{epochs}  loss={mean_loss:.4f}"
+                msg = f"epoch {epoch + 1}/{total_epochs}  loss={mean_loss:.4f}"
                 if val_loss is not None:
                     msg += f"  val_loss={val_loss:.4f}  ppl={val_ppl:.2f}"
-                self.progress_fn((epoch + 1) / epochs, msg)
+                self.progress_fn((epoch + 1) / total_epochs, msg)
 
         training_time = time.monotonic() - t_total
         final_val_loss = val_loss_history[-1] if val_loss_history else None
@@ -310,7 +331,7 @@ class GPTTrainer:
             "final_loss": loss_history[-1] if loss_history else 0.0,
             "final_val_loss": final_val_loss,
             "final_val_perplexity": final_val_ppl,
-            "epochs": epochs,
+            "epochs": total_epochs,
             "param_count": self.model.param_count(),
             "training_time_s": round(training_time, 3),
             "seed": seed,
@@ -318,7 +339,7 @@ class GPTTrainer:
         })
 
         self._callbacks.on_train_end(self, {
-            "epochs": epochs,
+            "epochs": total_epochs,
             "total_steps": global_step,
             "training_time_s": training_time,
         })
