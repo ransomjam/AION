@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build / experiment outputs (kept out of git; reproduced from code + seed)
+build/
+experiments/*/output/
+!experiments/*/output/.gitkeep
+
+# Editor / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# AION workspace — project data lives here; it is data, not code.
+# Override the location with AION_WORKSPACE.
+workspace/
+
+# Local machine config
+local.properties
+
+# Retired Camtinel local artifacts (kept on disk, never committed).
+# Full Camtinel source is preserved at the git tag `camtinel-final`.
+.gradle/
+keystore.properties
+keystore/
+*.jks
+*.keystore
