@@ -40,6 +40,16 @@ class TrainingConfig:
     checkpoint_every_n_epochs: int = 1
     keep_last_n_checkpoints: int = 3
 
+    # ── step-based checkpointing (crash-safe, for long CPU runs) ──────────────
+    # When ``checkpoint_every_n_steps`` or ``checkpoint_every_minutes`` is set,
+    # the trainer writes complete, atomic checkpoints mid-epoch (model +
+    # optimizer + scheduler + RNG + history + step/epoch) so a run can resume
+    # from close to where it stopped instead of only at epoch boundaries.
+    checkpoint_every_n_steps: int = 0        # 0 = disabled (epoch checkpoints only)
+    checkpoint_every_minutes: float = 0.0    # 0 = disabled; wall-clock autosave
+    keep_last_n_step_checkpoints: int = 5     # historical step_<N>/ dirs to keep
+    log_every_n_steps: int = 50               # progress/ETA logging cadence
+
     # ── evaluation ────────────────────────────────────────────────────────────
     eval_every_n_epochs: int = 1
     eval_batches: int | None = None  # None = full validation set
@@ -91,6 +101,18 @@ class TrainingConfig:
         if self.keep_last_n_checkpoints <= 0:
             raise ValueError(
                 f"keep_last_n_checkpoints must be > 0, got {self.keep_last_n_checkpoints}"
+            )
+        if self.checkpoint_every_n_steps < 0:
+            raise ValueError(
+                f"checkpoint_every_n_steps must be >= 0, got {self.checkpoint_every_n_steps}"
+            )
+        if self.checkpoint_every_minutes < 0:
+            raise ValueError(
+                f"checkpoint_every_minutes must be >= 0, got {self.checkpoint_every_minutes}"
+            )
+        if self.log_every_n_steps <= 0:
+            raise ValueError(
+                f"log_every_n_steps must be > 0, got {self.log_every_n_steps}"
             )
         if self.eval_every_n_epochs <= 0:
             raise ValueError(

@@ -30,12 +30,23 @@ All artifacts saved to workspace/projects/aion-01/.
 
 from __future__ import annotations
 
+import logging
 import sys
 import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+
+# Route the training pipeline's stage/progress logging to stdout with elapsed
+# timestamps.  The framework emits these at INFO level; configuring logging here
+# (and only here) makes them visible without affecting library/test callers.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(message)s",
+    datefmt="%H:%M:%S",
+    stream=sys.stdout,
+)
 
 from aion.tokenizers.store import TokenizerStore
 from aion.workspace.store import ProjectStore
@@ -126,6 +137,13 @@ def main() -> None:
         min_lr=3e-5,
         checkpoint_every_n_epochs=1,
         keep_last_n_checkpoints=3,
+        # Crash-safe step checkpointing: a full checkpoint every 250 steps AND
+        # every 15 minutes of wall-clock, so a multi-hour CPU epoch can never
+        # lose more than one interval of progress.
+        checkpoint_every_n_steps=250,
+        checkpoint_every_minutes=15.0,
+        keep_last_n_step_checkpoints=5,
+        log_every_n_steps=50,
         eval_every_n_epochs=1,
         eval_batches=None,
         sample_every_n_epochs=1,
@@ -159,6 +177,16 @@ def main() -> None:
     except ResumeError as exc:
         print(f"\nERROR: {exc}")
         sys.exit(1)
+    except KeyboardInterrupt:
+        # The trainer has already saved a final checkpoint before the interrupt
+        # propagated here.  Report and exit cleanly — no work is lost.
+        print(
+            "\n\nTraining interrupted.\n"
+            "Checkpoint saved successfully.\n\n"
+            "Resume using:\n\n"
+            "    python scripts/train_aion01.py --resume\n"
+        )
+        sys.exit(130)
     print()  # newline after final progress bar
 
     elapsed = time.monotonic() - t0

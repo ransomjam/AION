@@ -13,7 +13,9 @@ disposable and may be safely cleared by the user.
 from __future__ import annotations
 
 import json
+import logging
 import statistics
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,6 +25,8 @@ from aion.datasets.store import DatasetStore
 from aion.util import fingerprint as _fp
 
 from .fingerprint import DatasetFingerprint
+
+logger = logging.getLogger("aion.training.corpus")
 
 
 @dataclass
@@ -115,6 +119,7 @@ class CorpusManager:
             Optional ``progress_fn(fraction, message)`` callback.
         """
         # Compute per-dataset fingerprints
+        logger.info("Loading corpus: datasets=%s split=%.2f", dataset_ids, split)
         ds_fps = []
         for ds_id in dataset_ids:
             ds = self._store.open(ds_id)
@@ -132,13 +137,21 @@ class CorpusManager:
         )
 
         # Check cache
+        t_cache = time.monotonic()
         cached = self._load_cache(fp.combined)
         if cached is not None:
+            logger.info(
+                "Corpus cache HIT (%s) in %.2fs: %d train / %d val tokens",
+                fp.combined[:12], time.monotonic() - t_cache,
+                len(cached.train_tokens), len(cached.val_tokens),
+            )
             return cached
+        logger.info("Corpus cache MISS (%s) — building from documents", fp.combined[:12])
 
         # Collect documents (source order), then optionally shuffle at the
         # document level.  Shuffling happens BEFORE tokenization/packing so the
         # validation tail is a representative mix of sources, not the last one.
+        t_load = time.monotonic()
         doc_texts: list[str] = []
         for ds_id in dataset_ids:
             ds = self._store.open(ds_id)
@@ -152,22 +165,46 @@ class CorpusManager:
                 f"corpus has too few documents: found {len(doc_texts)}, "
                 f"need at least {max(1, min_documents)}. Prepare more data before training."
             )
+        total_chars = sum(len(t) for t in doc_texts)
+        logger.info(
+            "Loaded %d documents (%d chars) in %.2fs",
+            len(doc_texts), total_chars, time.monotonic() - t_load,
+        )
 
         if shuffle_seed is not None:
             rng = np.random.default_rng(shuffle_seed)
             order = rng.permutation(len(doc_texts))
             doc_texts = [doc_texts[i] for i in order]
+            logger.info("Shuffled documents (seed=%d)", shuffle_seed)
 
+        # Tokenize documents
+        logger.info("Tokenizing %d documents...", len(doc_texts))
+        t_tok = time.monotonic()
         all_doc_tokens: list[list[int]] = []
         for text in doc_texts:
             all_doc_tokens.append(tokenizer.encode(text))
-            if progress_fn and len(all_doc_tokens) % 100 == 0:
-                progress_fn(0.0, f"tokenized {len(all_doc_tokens)} documents")
+            n_done = len(all_doc_tokens)
+            if n_done % 25 == 0 or n_done == len(doc_texts):
+                elapsed = time.monotonic() - t_tok
+                rate = n_done / elapsed if elapsed > 0 else 0.0
+                logger.info(
+                    "  tokenized %d/%d documents (%.1fs, %.1f docs/s)",
+                    n_done, len(doc_texts), elapsed, rate,
+                )
+                if progress_fn:
+                    progress_fn(n_done / len(doc_texts), f"tokenized {n_done} documents")
 
         if not all_doc_tokens:
             raise ValueError("corpus is empty — no documents found in the given datasets")
+        n_doc_tokens = sum(len(d) for d in all_doc_tokens)
+        logger.info(
+            "Tokenized %d documents -> %d tokens in %.2fs",
+            len(all_doc_tokens), n_doc_tokens, time.monotonic() - t_tok,
+        )
 
         # Pack into flat array with EOS separators
+        logger.info("Packing sequences (EOS id=%d)...", eos_id)
+        t_pack = time.monotonic()
         flat: list[int] = []
         for doc in all_doc_tokens:
             flat.extend(doc)
@@ -178,6 +215,10 @@ class CorpusManager:
         split_idx = int(len(tokens) * split)
         train_tokens = tokens[:split_idx]
         val_tokens = tokens[split_idx:]
+        logger.info(
+            "Packed %d tokens in %.2fs -> %d train / %d val",
+            len(tokens), time.monotonic() - t_pack, len(train_tokens), len(val_tokens),
+        )
 
         # Corpus statistics
         doc_lengths = [len(d) for d in all_doc_tokens]
@@ -206,7 +247,9 @@ class CorpusManager:
             fingerprint=fp,
             stats=stats,
         )
+        t_save = time.monotonic()
         self._save_cache(fp.combined, result)
+        logger.info("Cached corpus to disk in %.2fs", time.monotonic() - t_save)
         return result
 
     # ── cache helpers ─────────────────────────────────────────────────────────

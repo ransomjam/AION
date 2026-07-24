@@ -2,8 +2,11 @@
 
 Algorithm (Sennrich et al., 2016 — byte-level variant as in GPT-2):
 
-1. Pre-tokenize the corpus with the existing ``normalize`` + ``tokenize``
-   pipeline (one source of truth for text processing).
+1. Pre-tokenize the corpus **losslessly**: split raw text into whitespace runs,
+   alphanumeric runs, and individual punctuation/symbol characters, preserving
+   every character (case and whitespace included).  A byte-level BPE must not
+   normalise or case-fold — those steps are lossy and belong to the separate
+   word-level ``aion.tokenization`` tools, not here.
 2. Encode every pre-token as a sequence of UTF-8 byte symbols
    (``\\x00``..``\\xff``).  The base vocabulary is exactly 256 byte symbols
    plus the four special tokens — no OOV is possible for any Unicode input.
@@ -27,12 +30,12 @@ iteration.  An incremental index is a documented future optimization.
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections import Counter
 from collections.abc import Iterable
 from pathlib import Path
 
-from aion.tokenization.text import normalize, tokenize
 from .base import MergeStep, Tokenizer, TrainingResult
 
 __all__ = ["ByteLevelBPETokenizer"]
@@ -40,6 +43,21 @@ __all__ = ["ByteLevelBPETokenizer"]
 # ── Special tokens (fixed ids 0-3) ────────────────────────────────────────────
 _SPECIALS = ("<pad>", "<unk>", "<bos>", "<eos>")
 _PAD, _UNK, _BOS, _EOS = _SPECIALS
+
+# ── Lossless pre-tokenizer ────────────────────────────────────────────────────
+# Splits raw text into three kinds of pre-token, with NO loss of information:
+#   \s+        a run of whitespace (kept verbatim — spaces, tabs, newlines)
+#   \w+        a run of alphanumeric/underscore characters (case preserved)
+#   [^\s\w]    a single punctuation or symbol character
+# The three classes are mutually exclusive and cover every character, so the
+# concatenation of all pre-tokens exactly reconstructs the input.  This is what
+# makes encode/decode a lossless round-trip.
+_PRETOKEN_RE = re.compile(r"\s+|\w+|[^\s\w]", re.UNICODE)
+
+
+def _pretokenize(text: str) -> list[str]:
+    """Split ``text`` into lossless pre-tokens (whitespace and case preserved)."""
+    return _PRETOKEN_RE.findall(text)
 
 # ── Byte symbol encoding ──────────────────────────────────────────────────────
 # Each of the 256 possible byte values is represented as a printable symbol so
@@ -160,7 +178,7 @@ class ByteLevelBPETokenizer(Tokenizer):
         # ── 1. Build word frequency table ─────────────────────────────────────
         raw_freq: Counter = Counter()
         for doc in corpus:
-            for word in tokenize(normalize(doc), normalize_first=False):
+            for word in _pretokenize(doc):
                 raw_freq[word] += 1
 
         # Fail early on an empty corpus rather than emitting a degenerate
@@ -249,7 +267,7 @@ class ByteLevelBPETokenizer(Tokenizer):
         """Encode ``text`` to token ids using the learned merge rules."""
         unk_id = self._token_to_id.get(_UNK, 1)
         ids: list[int] = []
-        for word in tokenize(normalize(text), normalize_first=False):
+        for word in _pretokenize(text):
             symbols = list(_word_to_bytes(word))
             # Apply merges greedily in rank order
             while len(symbols) > 1:

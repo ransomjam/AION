@@ -79,13 +79,19 @@ class TestByteLevelBPETokenizer(unittest.TestCase):
         self.assertGreater(len(ids), 0)
 
     def test_decode_roundtrip(self):
+        # Byte-level BPE is lossless: decode(encode(x)) == x, including spaces.
         text = "the cat sat"
-        ids = self.tok.encode(text)
-        decoded = self.tok.decode(ids)
-        # Pre-tokenization strips spaces, so decoded is the concatenation of
-        # the pre-tokens without spaces.  Words should be present.
-        self.assertIn("cat", decoded)
-        self.assertIn("sat", decoded)
+        self.assertEqual(self.tok.decode(self.tok.encode(text)), text)
+
+    def test_decode_roundtrip_preserves_case_and_whitespace(self):
+        # Regression test: case and whitespace must survive a round-trip.
+        for text in [
+            "The history of science.",
+            "The history of science and mathematics.",
+            "Multiple   spaces\tand\nnewlines",
+            "MixedCASE and punctuation! 123",
+        ]:
+            self.assertEqual(self.tok.decode(self.tok.encode(text)), text)
 
     def test_encode_unknown_bytes_no_crash(self):
         # Byte-level BPE should handle any Unicode without raising

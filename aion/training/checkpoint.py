@@ -13,12 +13,16 @@ The ``best/`` checkpoint is a file copy (not a symlink) for Windows compatibilit
 from __future__ import annotations
 
 import json
+import logging
 import shutil
+import time
 from pathlib import Path
 
 from aion.gpt.checkpoint import GPTCheckpoint
 from aion.gpt.trainer import TrainingCallback
 from aion.util import now_iso
+
+logger = logging.getLogger("aion.training.checkpoint")
 
 
 class CheckpointManager:
@@ -178,7 +182,12 @@ class CheckpointCallback(TrainingCallback):
                 for k in ("mean_loss", "val_loss", "val_perplexity", "global_step")
                 if k in context
             }
-            self.manager.save(
+            logger.info("Saving checkpoint at epoch %d...", epoch + 1)
+            _t = time.monotonic()
+            path = self.manager.save(
                 trainer.model, epoch + 1, metrics,
                 optimizer=getattr(trainer, "optimizer", None),
+            )
+            logger.info(
+                "Checkpoint saved: %s in %.2fs", path.name, time.monotonic() - _t,
             )

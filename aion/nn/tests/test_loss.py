@@ -2,9 +2,23 @@
 
 import unittest
 import numpy as np
-from aion.nn.tensor import Tensor
+from aion.nn.tensor import Tensor, get_default_dtype, set_default_dtype
 from aion.nn.loss import BCELoss, CrossEntropyLoss, MSELoss
 from aion.nn.ops import t_sum as _sum
+
+# Finite-difference gradient checks need float64 precision; opt in for this
+# module and restore the framework default (float32) afterwards.
+_SAVED_DTYPE = None
+
+
+def setUpModule():
+    global _SAVED_DTYPE
+    _SAVED_DTYPE = get_default_dtype()
+    set_default_dtype(np.float64)
+
+
+def tearDownModule():
+    set_default_dtype(_SAVED_DTYPE)
 
 
 def numerical_grad_loss(loss_fn, pred_data, targets, eps=1e-5):

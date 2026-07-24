@@ -243,7 +243,7 @@ class TransformerStore:
         for i, p in enumerate(model.parameters()):
             key = param_keys[i] if i < len(param_keys) else _param_key(i, p)
             if key in weights:
-                p.data = weights[key].astype(np.float64)
+                p.data = weights[key].astype(p.data.dtype)
 
         return model
 

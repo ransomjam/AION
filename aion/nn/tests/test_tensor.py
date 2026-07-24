@@ -2,7 +2,7 @@
 
 import unittest
 import numpy as np
-from aion.nn.tensor import Tensor, tensor
+from aion.nn.tensor import Tensor, tensor, get_default_dtype
 from aion.nn.ops import add, matmul, mul, relu, sum as t_sum
 
 
@@ -11,13 +11,22 @@ class TestTensorBasics(unittest.TestCase):
         t = Tensor([1.0, 2.0])
         self.assertIsInstance(t.data, np.ndarray)
 
+    def test_default_dtype_is_float32(self):
+        # Training default is float32 to keep the autograd graph's memory bounded.
+        self.assertEqual(Tensor([1.0, 2.0]).data.dtype, np.float32)
+        self.assertEqual(get_default_dtype(), np.float32)
+
+    def test_explicit_dtype_override(self):
+        self.assertEqual(Tensor([1.0], dtype=np.float64).data.dtype, np.float64)
+
     def test_shape_and_ndim(self):
         t = Tensor(np.ones((3, 4)))
         self.assertEqual(t.shape, (3, 4))
         self.assertEqual(t.ndim, 2)
 
     def test_item(self):
-        t = Tensor(np.array(3.14))
+        # Exact scalar value requires float64; opt in via the explicit dtype.
+        t = Tensor(np.array(3.14), dtype=np.float64)
         self.assertAlmostEqual(t.item(), 3.14)
 
     def test_grad_none_initially(self):

@@ -40,16 +40,31 @@ recovers that run_id and continues the SAME run — restoring model weights,
 optimizer state, and RNG state, and continuing epoch/checkpoint numbering.
 If no prior run is recorded, resume raises ResumeError rather than silently
 starting over.
+
+Two checkpoint systems coexist (see ADR 0013):
+
+- **Step-based (crash-safe)** — active when ``checkpoint_every_n_steps`` or
+  ``checkpoint_every_minutes`` is set.  Complete bundles are written atomically
+  every N steps / minutes, on each epoch boundary, and on Ctrl+C, to
+  ``checkpoints/<run_id>/{latest,step_<N>}/``.  ``--resume`` restores the full
+  ``latest/`` bundle and continues at the exact interrupted step (mid-epoch),
+  bit-identically to an uninterrupted run.
+- **Epoch-based (legacy default)** — used when no step cadence is configured;
+  checkpoints and resumes only at epoch boundaries via ``ResumeTraining``.
 """
 
 from __future__ import annotations
 
 import json
+import logging
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+
+logger = logging.getLogger("aion.training.project")
 
 from aion.gpt.data import BatchSampler, TokenizedDataset
 from aion.gpt.experiment import record_gpt_experiment
@@ -69,6 +84,7 @@ from .model_card import ModelCard
 from .resume import ResumeError, ResumeTraining
 from .sampler import SampleGenerator
 from .scheduler import SchedulerCallback, build_scheduler
+from .step_checkpoint import StepCheckpointManager
 from .fingerprint import DatasetFingerprint
 
 
@@ -285,16 +301,24 @@ class TrainingProject:
         rng_sample = np.random.default_rng(seed + 2)
 
         # ── tokenizer ─────────────────────────────────────────────────────────
+        logger.info("Resolving tokenizer %s...", cfg.tokenizer_id)
+        t_stage = time.monotonic()
         from aion.tokenizers.store import TokenizerStore
         ts = TokenizerStore(project.dir("tokenizers"))
         tok_manifest = ts.open_manifest(cfg.tokenizer_id)
         tokenizer = ts.load(cfg.tokenizer_id)
         tok_fp = tok_manifest.get("vocabulary_fingerprint", "")
         eos_id = tokenizer.eos_id  # public accessor — do not assume a physical id
+        logger.info(
+            "Tokenizer loaded (vocab=%d, eos_id=%d) in %.2fs",
+            tokenizer.vocab_size, eos_id, time.monotonic() - t_stage,
+        )
 
         # ── corpus ────────────────────────────────────────────────────────────
         # Documents are shuffled deterministically (seed = cfg.seed) before the
         # train/val split so validation is a representative mix of sources.
+        # (CorpusManager.build logs its own loading/tokenizing/packing stages.)
+        t_stage = time.monotonic()
         corpus_mgr = CorpusManager(project.data_dir(), project.cache_dir())
         corpus = corpus_mgr.build(
             cfg.dataset_ids,
@@ -306,15 +330,26 @@ class TrainingProject:
             shuffle_seed=cfg.seed,
             progress_fn=progress_fn,
         )
+        logger.info("Corpus ready in %.2fs", time.monotonic() - t_stage)
 
         # ── datasets ──────────────────────────────────────────────────────────
+        logger.info("Building train/validation datasets (context_length=%d)...",
+                    cfg.context_length)
+        t_stage = time.monotonic()
         train_ds = TokenizedDataset(corpus.train_tokens, cfg.context_length)
         val_ds = (
             TokenizedDataset(corpus.val_tokens, cfg.context_length)
             if len(corpus.val_tokens) >= cfg.context_length + 1
             else None
         )
+        logger.info(
+            "Datasets built in %.2fs: %d train blocks, %d val blocks",
+            time.monotonic() - t_stage, len(train_ds),
+            len(val_ds) if val_ds is not None else 0,
+        )
 
+        # ── batches ───────────────────────────────────────────────────────────
+        logger.info("Creating batch samplers (batch_size=%d)...", cfg.batch_size)
         def train_sampler():
             return BatchSampler(train_ds, cfg.batch_size, shuffle=True, rng=rng_data)
 
@@ -322,8 +357,14 @@ class TrainingProject:
             BatchSampler(val_ds, cfg.batch_size, shuffle=False)
             if val_ds is not None else None
         )
+        logger.info(
+            "Batch samplers ready: ~%d train steps/epoch",
+            (len(train_ds) + cfg.batch_size - 1) // cfg.batch_size,
+        )
 
         # ── model ─────────────────────────────────────────────────────────────
+        logger.info("Building model...")
+        t_stage = time.monotonic()
         from aion.gpt.config import GPTConfig
         gpt_cfg = GPTConfig.from_dict({
             **cfg.gpt_config,
@@ -331,12 +372,20 @@ class TrainingProject:
             "max_seq_len": cfg.context_length,
         })
         model = GPTModel(gpt_cfg, rng=rng_model)
+        logger.info(
+            "Model built in %.2fs: %s params",
+            time.monotonic() - t_stage, f"{model.param_count():,}",
+        )
 
         # ── optimizer ─────────────────────────────────────────────────────────
+        logger.info("Initializing optimizer (%s, lr=%g)...",
+                    cfg.optimizer, cfg.learning_rate)
+        t_stage = time.monotonic()
         if cfg.optimizer == "adam":
             optimizer = Adam(model.parameters(), lr=cfg.learning_rate)
         else:
             optimizer = SGD(model.parameters(), lr=cfg.learning_rate)
+        logger.info("Optimizer ready in %.2fs", time.monotonic() - t_stage)
 
         # ── callbacks ─────────────────────────────────────────────────────────
         metrics_log = logs_dir / "metrics.jsonl"
@@ -355,12 +404,68 @@ class TrainingProject:
             min_lr=cfg.min_lr,
         )
 
+        # ── step-based checkpointing (crash-safe) ─────────────────────────────
+        step_ckpt_enabled = (
+            cfg.checkpoint_every_n_steps > 0 or cfg.checkpoint_every_minutes > 0
+        )
+        step_mgr = None
+        checkpoint_fn = None
+        steps_per_epoch_est = (len(train_ds) + cfg.batch_size - 1) // cfg.batch_size
+        if step_ckpt_enabled:
+            step_mgr = StepCheckpointManager(
+                project.dir("checkpoints"), run_id,
+                keep_last_n=cfg.keep_last_n_step_checkpoints,
+            )
+
+            def checkpoint_fn(reason: str, ts: dict) -> None:
+                t0 = time.monotonic()
+                state = {
+                    "run_id": run_id,
+                    "model_name": cfg.model_name,
+                    "global_step": ts["global_step"],
+                    "epoch": ts["epoch"],
+                    "batch_in_epoch": ts["batch_in_epoch"],
+                    "total_epochs": ts["total_epochs"],
+                    "reason": reason,
+                    "created_at": now_iso(),
+                    "tokens_processed": ts["tokens_processed"],
+                    "rng": {
+                        "model": rng_model.bit_generator.state,
+                        "sample": rng_sample.bit_generator.state,
+                        "data_epoch_start": ts["data_rng_epoch_state"],
+                    },
+                    "scheduler": {
+                        "name": cfg.scheduler,
+                        "base_lr": cfg.learning_rate,
+                        "min_lr": cfg.min_lr,
+                        "warmup_steps": cfg.warmup_steps,
+                        "total_steps": cfg.epochs * steps_per_epoch_est,
+                    },
+                    "history": ts["history"],
+                    "config": cfg.to_dict(),
+                }
+                latest = step_mgr.save(model, optimizer, state)
+                dt = time.monotonic() - t0
+                sep = "-" * 40
+                print(f"\n{sep}\nCheckpoint saved\n\n"
+                      f"Step: {ts['global_step']}\n"
+                      f"Epoch: {ts['epoch']}\n"
+                      f"Time: {dt:.2f} sec\n\n"
+                      f"Directory:\n\n{latest}\n{sep}", flush=True)
+                logger.info("Checkpoint (%s) saved at step %d in %.2fs",
+                            reason, ts["global_step"], dt)
+
         callbacks: list[TrainingCallback] = [
             SchedulerCallback(scheduler),
             _MetricsCallback(collector),
-            CheckpointCallback(ckpt_mgr, every_n_epochs=cfg.checkpoint_every_n_epochs),
             _RNGCallback(logs_dir, rng_model, rng_data, rng_sample),
         ]
+        # Epoch-boundary checkpoints (old format) only when step-checkpointing is
+        # off, to avoid two systems writing checkpoints for the same run.
+        if not step_ckpt_enabled:
+            callbacks.insert(
+                2, CheckpointCallback(ckpt_mgr, every_n_epochs=cfg.checkpoint_every_n_epochs)
+            )
 
         if cfg.sample_prompts:
             sample_gen = SampleGenerator(
@@ -377,27 +482,59 @@ class TrainingProject:
         # ── resume ────────────────────────────────────────────────────────────
         start_epoch = 0
         start_step = 0
+        start_batch_in_epoch = 0
         prior_history: dict | None = None
         if resume:
-            resumer = ResumeTraining(ckpt_mgr, logs_dir)
-            if not resumer.can_resume():
-                raise ResumeError(
-                    f"--resume requested but run {run_id!r} for model {cfg.model_name!r} "
-                    f"has no saved checkpoints to resume from."
+            if step_mgr is not None and step_mgr.has_checkpoint():
+                # Step-based resume: locate latest/ automatically and restore the
+                # complete state (model, optimizer, scheduler-via-step, RNG,
+                # history, global_step, epoch, batch_in_epoch).
+                loaded = step_mgr.load_latest()
+                StepCheckpointManager.restore_model(model, loaded)
+                StepCheckpointManager.restore_optimizer(optimizer, loaded)
+                rng = loaded.state.get("rng", {})
+                if rng.get("model") is not None:
+                    rng_model.bit_generator.state = rng["model"]
+                if rng.get("sample") is not None:
+                    rng_sample.bit_generator.state = rng["sample"]
+                if rng.get("data_epoch_start") is not None:
+                    rng_data.bit_generator.state = rng["data_epoch_start"]
+                start_step = loaded.global_step
+                start_epoch = loaded.epoch
+                start_batch_in_epoch = loaded.batch_in_epoch
+                prior_history = loaded.state.get("history")
+                if start_epoch >= cfg.epochs and start_batch_in_epoch == 0:
+                    raise ResumeError(
+                        f"run {run_id!r} already completed all {cfg.epochs} epochs. "
+                        f"Increase epochs to continue training."
+                    )
+                logger.info(
+                    "Resuming run %s from checkpoint: step=%d epoch=%d batch_in_epoch=%d (%s)",
+                    run_id, start_step, start_epoch, start_batch_in_epoch, loaded.directory,
                 )
-            state = resumer.restore(model, optimizer)
-            start_epoch = state.start_epoch
-            start_step = state.start_step
-            if state.rng_states:
-                ResumeTraining.restore_rng_state(
-                    state.rng_states, rng_model, rng_data, rng_sample,
-                )
-            prior_history = self._history_from_records(state.metrics_history)
-            if start_epoch >= cfg.epochs:
-                raise ResumeError(
-                    f"run {run_id!r} already completed {start_epoch} epoch(s), which meets "
-                    f"the configured epochs={cfg.epochs}. Increase epochs to continue training."
-                )
+            else:
+                # Epoch-based resume (backward-compatible path).
+                resumer = ResumeTraining(ckpt_mgr, logs_dir)
+                if not resumer.can_resume():
+                    raise ResumeError(
+                        f"--resume requested but run {run_id!r} for model {cfg.model_name!r} "
+                        f"has no saved checkpoints to resume from."
+                    )
+                state = resumer.restore(model, optimizer)
+                start_epoch = state.start_epoch
+                start_step = state.start_step
+                if state.rng_states:
+                    ResumeTraining.restore_rng_state(
+                        state.rng_states, rng_model, rng_data, rng_sample,
+                    )
+                prior_history = self._history_from_records(state.metrics_history)
+                if start_epoch >= cfg.epochs:
+                    raise ResumeError(
+                        f"run {run_id!r} already completed {start_epoch} epoch(s), which meets "
+                        f"the configured epochs={cfg.epochs}. Increase epochs to continue training."
+                    )
+                logger.info("Resuming run %s from epoch %d (step %d)",
+                            run_id, start_epoch, start_step)
 
         # ── write config snapshot ─────────────────────────────────────────────
         config_path = logs_dir / "config.json"
@@ -411,8 +548,22 @@ class TrainingProject:
             grad_clip=cfg.grad_clip,
             callbacks=TrainingCallbackList(callbacks),
             progress_fn=progress_fn,
+            log_every_n_steps=cfg.log_every_n_steps,
         )
         remaining_epochs = cfg.epochs - start_epoch
+        logger.info(
+            "Starting training: %d epoch(s) (%d..%d), run_id=%s",
+            remaining_epochs, start_epoch + 1, cfg.epochs, run_id,
+        )
+        if step_ckpt_enabled:
+            logger.info(
+                "Step checkpointing: every %d steps%s, keep last %d",
+                cfg.checkpoint_every_n_steps,
+                f" / {cfg.checkpoint_every_minutes:g} min"
+                if cfg.checkpoint_every_minutes else "",
+                cfg.keep_last_n_step_checkpoints,
+            )
+        t_train = time.monotonic()
         result = trainer.train(
             train_sampler,
             epochs=remaining_epochs,
@@ -422,9 +573,17 @@ class TrainingProject:
             start_step=start_step,
             total_epochs=cfg.epochs,
             history=prior_history,
+            data_rng=rng_data,
+            start_batch_in_epoch=start_batch_in_epoch,
+            checkpoint_fn=checkpoint_fn,
+            checkpoint_every_n_steps=cfg.checkpoint_every_n_steps,
+            checkpoint_every_minutes=cfg.checkpoint_every_minutes,
         )
+        logger.info("Training loop finished in %.1fs", time.monotonic() - t_train)
 
         # ── save model ────────────────────────────────────────────────────────
+        logger.info("Saving model...")
+        t_stage = time.monotonic()
         gpt_store = GPTStore(project.dir("models"))
         model_manifest = gpt_store.save(
             model, result,
@@ -437,8 +596,10 @@ class TrainingProject:
             params={"training_config": cfg.to_dict()},
         )
         model_id = model_manifest["id"]
+        logger.info("Model saved as %s in %.2fs", model_id, time.monotonic() - t_stage)
 
         # ── experiment record ─────────────────────────────────────────────────
+        logger.info("Recording experiment...")
         exp_store = ExperimentStore(project.dir("experiments"))
         trainable = sum(
             p.data.size for p in model.parameters() if p.requires_grad
@@ -469,6 +630,7 @@ class TrainingProject:
         )
 
         # ── model card ────────────────────────────────────────────────────────
+        logger.info("Generating model card...")
         card = ModelCard(
             model_name=cfg.model_name,
             gpt_config=gpt_cfg.to_dict(),
@@ -492,6 +654,7 @@ class TrainingProject:
             json.dumps(card_result.data, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        logger.info("Run complete: model=%s checkpoints=%s", model_id, ckpt_mgr.run_dir)
 
         return TrainingRunResult(
             run_id=run_id,

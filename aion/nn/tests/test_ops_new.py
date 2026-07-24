@@ -3,8 +3,22 @@
 import unittest
 import numpy as np
 
-from aion.nn.tensor import Tensor
+from aion.nn.tensor import Tensor, get_default_dtype, set_default_dtype
 from aion.nn.ops import softmax, transpose
+
+# Finite-difference gradient checks need float64 precision; opt in for this
+# module and restore the framework default (float32) afterwards.
+_SAVED_DTYPE = None
+
+
+def setUpModule():
+    global _SAVED_DTYPE
+    _SAVED_DTYPE = get_default_dtype()
+    set_default_dtype(np.float64)
+
+
+def tearDownModule():
+    set_default_dtype(_SAVED_DTYPE)
 
 
 def numerical_grad(f, x_data, eps=1e-5):

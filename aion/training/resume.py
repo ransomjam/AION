@@ -1,10 +1,17 @@
-"""ResumeTraining — restore a training run from a checkpoint.
+"""ResumeTraining — restore an EPOCH-based training run from a checkpoint.
 
 Restores model weights, optimizer state (moment buffers + step counter), and
-RNG state from the latest checkpoint, and returns the epoch/step to resume
-from.  RNG state is serialized to JSON alongside each checkpoint; together with
-the restored optimizer state this lets a resumed run continue as if it had
-never stopped.
+RNG state from the latest epoch checkpoint, and returns the epoch/step to
+resume from.  RNG state is serialized to JSON alongside each checkpoint;
+together with the restored optimizer state this lets a resumed run continue as
+if it had never stopped.
+
+This is the backward-compatible resume path used when *step-based* checkpointing
+is disabled (``checkpoint_every_n_steps == 0`` and
+``checkpoint_every_minutes == 0``).  When step-based checkpointing is enabled,
+``TrainingProject`` resumes from the crash-safe ``latest/`` bundle instead —
+see :mod:`aion.training.step_checkpoint` and ADR 0013 — which additionally
+supports resuming *mid-epoch* at the exact interrupted step.
 """
 
 from __future__ import annotations

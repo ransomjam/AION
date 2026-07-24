@@ -183,7 +183,7 @@ class ModelStore:
         for p in model.parameters():
             key = p.name or f"param_{model.parameters().index(p)}"
             if key in weights:
-                p.data = weights[key].astype(np.float64)
+                p.data = weights[key].astype(p.data.dtype)
         return model
 
     def statistics(self, model_id: str) -> dict | None:

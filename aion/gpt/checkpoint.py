@@ -115,7 +115,7 @@ class GPTCheckpoint:
         for i, p in enumerate(model.parameters()):
             key = param_keys[i] if i < len(param_keys) else _param_key(i, p)
             if key in weights:
-                p.data = weights[key].astype(np.float64)
+                p.data = weights[key].astype(p.data.dtype)
 
         if optimizer is not None and meta.get("optimizer") is not None:
             optim_path = self._optim_path(epoch)
