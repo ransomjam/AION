@@ -47,6 +47,8 @@ from pathlib import Path
 
 import numpy as np
 
+from aion import backend
+
 SCHEMA_VERSION = 1
 
 
@@ -109,7 +111,10 @@ def _write_bundle(dst: Path, model, optimizer, state: dict) -> None:
     dst.mkdir(parents=True, exist_ok=True)
 
     params = model.parameters()
-    weights = {_param_key(i, p): p.data for i, p in enumerate(params)}
+    # Host copies, so a checkpoint is device-neutral: a run interrupted on a
+    # GPU pod can be resumed on a CPU box and the reverse.
+    weights = {_param_key(i, p): backend.to_host(p.data)
+               for i, p in enumerate(params)}
     np.savez(str(dst / "model.npz"), **weights)
 
     state = dict(state)
@@ -241,7 +246,8 @@ class StepCheckpointManager:
         for i, p in enumerate(model.parameters()):
             key = param_keys[i] if i < len(param_keys) else _param_key(i, p)
             if key in loaded.model_weights:
-                p.data = loaded.model_weights[key].astype(p.data.dtype)
+                p.data = backend.asarray(
+                    loaded.model_weights[key], dtype=p.data.dtype)
 
     @staticmethod
     def restore_optimizer(optimizer, loaded: LoadedCheckpoint) -> None:

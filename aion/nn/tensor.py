@@ -37,15 +37,21 @@ downstream tensors and never accumulates a gradient.  This is the foundation
 for layer freezing and fine-tuning: set ``param.requires_grad = False`` and
 that parameter is excluded from the graph and from optimizer updates.
 
-NumPy is the backend.  ``Tensor.data`` is always ``np.ndarray``.  Replacing
-NumPy with CuPy or another array library means changing what ``data`` holds;
-the graph machinery is unchanged.
+Compute backend
+---------------
+``Tensor.data`` is an array of whatever library :mod:`aion.backend` selected —
+NumPy on the CPU, CuPy on CUDA.  Construction is the crossing point: whatever
+is handed to ``Tensor`` lands on the active device, so every array reaching
+the graph is already there and the graph machinery itself is unchanged.
 """
 
 from __future__ import annotations
 
 from typing import Callable
 import numpy as np
+
+from aion import backend
+from aion.backend import xp
 
 
 # ── Default compute dtype ─────────────────────────────────────────────────────
@@ -92,7 +98,7 @@ class Tensor:
         requires_grad: bool = False,
         dtype=None,
     ) -> None:
-        self.data: np.ndarray = np.asarray(data, dtype=dtype or _DEFAULT_DTYPE)
+        self.data = backend.asarray(data, dtype=dtype or _DEFAULT_DTYPE)
         self.grad: np.ndarray | None = None
         self.requires_grad: bool = requires_grad
         self._backward: Callable[[], None] = _noop
@@ -127,7 +133,7 @@ class Tensor:
         _visit(self)
 
         # Seed: treat self as a scalar loss (or sum to scalar before calling).
-        self.grad = np.ones_like(self.data)
+        self.grad = xp.ones_like(self.data)
 
         for t in reversed(order):
             t._backward()
@@ -152,8 +158,13 @@ class Tensor:
     # ── convenience ───────────────────────────────────────────────────────────
 
     def item(self) -> float:
-        """Return the scalar value of a single-element tensor."""
-        return float(self.data.flat[0])
+        """Return the scalar value of a single-element tensor.
+
+        On a GPU this is a synchronisation point — the value has to come back
+        to the host.  That is unavoidable and correct here; it is the reason
+        the training loop reads the loss once per step and not more.
+        """
+        return float(backend.to_host(self.data).reshape(-1)[0])
 
     @property
     def shape(self) -> tuple[int, ...]:

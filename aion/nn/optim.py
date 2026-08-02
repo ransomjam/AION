@@ -28,6 +28,9 @@ from abc import ABC, abstractmethod
 
 import numpy as np
 
+from aion import backend
+from aion.backend import xp
+
 from .parameter import Parameter
 
 
@@ -53,6 +56,11 @@ class Optimizer(ABC):
     # metadata and buffers in an ``.npz`` alongside the model weights.  Buffers
     # are keyed by PARAMETER INDEX (not ``id(p)``, which is not stable across
     # processes) so they re-bind correctly to a freshly constructed optimizer.
+    #
+    # ``moment_arrays`` always returns HOST arrays and ``load_state_dict``
+    # always places them back on the compute device.  That is what makes a
+    # checkpoint device-neutral: a run started on a GPU pod resumes on a CPU
+    # laptop, and the reverse.
 
     def state_dict(self) -> dict:
         """Return JSON-serializable optimizer scalars."""
@@ -104,7 +112,8 @@ class SGD(Optimizer):
 
     def moment_arrays(self) -> dict[str, np.ndarray]:
         idx = {id(p): i for i, p in enumerate(self.parameters)}
-        return {f"vel_{idx[pid]}": v for pid, v in self._velocity.items()}
+        return {f"vel_{idx[pid]}": backend.to_host(v)
+                for pid, v in self._velocity.items()}
 
     def load_state_dict(self, scalars: dict, arrays: dict) -> None:
         if "lr" in scalars:
@@ -115,7 +124,7 @@ class SGD(Optimizer):
         for i, p in enumerate(self.parameters):
             key = f"vel_{i}"
             if key in arrays:
-                self._velocity[id(p)] = np.asarray(arrays[key])
+                self._velocity[id(p)] = backend.asarray(arrays[key])
 
     def step(self) -> None:
         for p in self.parameters:
@@ -124,7 +133,7 @@ class SGD(Optimizer):
             if self.momentum != 0.0:
                 v = self._velocity.get(id(p))
                 if v is None:
-                    v = np.zeros_like(p.data)
+                    v = xp.zeros_like(p.data)
                 v = self.momentum * v + p.grad
                 self._velocity[id(p)] = v
                 p.data -= self.lr * v
@@ -182,9 +191,9 @@ class Adam(Optimizer):
         idx = {id(p): i for i, p in enumerate(self.parameters)}
         arrays: dict[str, np.ndarray] = {}
         for pid, m in self._m.items():
-            arrays[f"m_{idx[pid]}"] = m
+            arrays[f"m_{idx[pid]}"] = backend.to_host(m)
         for pid, v in self._v.items():
-            arrays[f"v_{idx[pid]}"] = v
+            arrays[f"v_{idx[pid]}"] = backend.to_host(v)
         return arrays
 
     def load_state_dict(self, scalars: dict, arrays: dict) -> None:
@@ -199,9 +208,9 @@ class Adam(Optimizer):
         for i, p in enumerate(self.parameters):
             mk, vk = f"m_{i}", f"v_{i}"
             if mk in arrays:
-                self._m[id(p)] = np.asarray(arrays[mk])
+                self._m[id(p)] = backend.asarray(arrays[mk])
             if vk in arrays:
-                self._v[id(p)] = np.asarray(arrays[vk])
+                self._v[id(p)] = backend.asarray(arrays[vk])
 
     def step(self) -> None:
         self._t += 1
@@ -209,8 +218,8 @@ class Adam(Optimizer):
             if not p.requires_grad or p.grad is None:
                 continue
             pid = id(p)
-            m = self._m.get(pid, np.zeros_like(p.data))
-            v = self._v.get(pid, np.zeros_like(p.data))
+            m = self._m.get(pid, xp.zeros_like(p.data))
+            v = self._v.get(pid, xp.zeros_like(p.data))
 
             m = self.beta1 * m + (1.0 - self.beta1) * p.grad
             v = self.beta2 * v + (1.0 - self.beta2) * (p.grad ** 2)
@@ -221,4 +230,4 @@ class Adam(Optimizer):
             m_hat = m / (1.0 - self.beta1 ** self._t)
             v_hat = v / (1.0 - self.beta2 ** self._t)
 
-            p.data -= self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
+            p.data -= self.lr * m_hat / (xp.sqrt(v_hat) + self.eps)

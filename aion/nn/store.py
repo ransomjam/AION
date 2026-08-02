@@ -31,6 +31,7 @@ from pathlib import Path
 
 import numpy as np
 
+from aion import backend
 from aion.util import code_version, fingerprint, now_iso, slugify
 
 SCHEMA_VERSION = 1
@@ -99,8 +100,9 @@ class ModelStore:
         training_dir.mkdir(parents=True, exist_ok=True)
 
         # ── weights.npz ───────────────────────────────────────────────────────
+        # Host copies: a saved model is device-neutral, loadable wherever.
         weight_arrays = {
-            p.name or f"param_{i}": p.data
+            p.name or f"param_{i}": backend.to_host(p.data)
             for i, p in enumerate(model.parameters())
         }
         weights_path = model_dir / "weights.npz"
@@ -183,7 +185,7 @@ class ModelStore:
         for p in model.parameters():
             key = p.name or f"param_{model.parameters().index(p)}"
             if key in weights:
-                p.data = weights[key].astype(p.data.dtype)
+                p.data = backend.asarray(weights[key], dtype=p.data.dtype)
         return model
 
     def statistics(self, model_id: str) -> dict | None:

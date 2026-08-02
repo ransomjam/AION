@@ -119,7 +119,7 @@ class Trainer:
                 self.optimizer.step()               # 5. update parameters
                 # ─────────────────────────────────────────────────────────────
 
-                epoch_loss += float(loss.data.flat[0])
+                epoch_loss += loss.item()
                 n_batches += 1
 
             mean_loss = epoch_loss / max(1, n_batches)

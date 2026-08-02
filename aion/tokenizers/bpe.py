@@ -45,14 +45,29 @@ _SPECIALS = ("<pad>", "<unk>", "<bos>", "<eos>")
 _PAD, _UNK, _BOS, _EOS = _SPECIALS
 
 # ── Lossless pre-tokenizer ────────────────────────────────────────────────────
-# Splits raw text into three kinds of pre-token, with NO loss of information:
-#   \s+        a run of whitespace (kept verbatim — spaces, tabs, newlines)
-#   \w+        a run of alphanumeric/underscore characters (case preserved)
-#   [^\s\w]    a single punctuation or symbol character
-# The three classes are mutually exclusive and cover every character, so the
-# concatenation of all pre-tokens exactly reconstructs the input.  This is what
-# makes encode/decode a lossless round-trip.
-_PRETOKEN_RE = re.compile(r"\s+|\w+|[^\s\w]", re.UNICODE)
+# BPE only ever merges symbols WITHIN a pre-token, never across pre-token
+# boundaries.  What the pre-tokenizer separates, the tokenizer can never join.
+#
+# That makes the leading space decisive.  An earlier version of this pattern put
+# whitespace in its own class (``\s+|\w+|[^\s\w]``), which meant a space could
+# never merge into the word after it.  Every word then cost two tokens, the bare
+# space became 37.8% of the training corpus, and compression sat at 2.3
+# characters per token instead of the ~4 a byte-level BPE should reach.  A model
+# trained on that spends a third of its capacity and a third of its context
+# predicting spaces, and its per-token loss looks far better than the model is,
+# because a space after a word is almost free to predict.
+#
+# So the leading space attaches to its word, following GPT-2 (Radford et al.,
+# 2019).  The classes are:
+#   " ?\w+"        an optional single leading space, then alphanumerics
+#   " ?[^\s\w]+"   an optional single leading space, then punctuation/symbols
+#   "\s+(?!\S)"    a whitespace run not followed by a token (trailing runs)
+#   "\s+"          any remaining whitespace (multiple spaces, newlines)
+#
+# Losslessness is unchanged: every character falls in exactly one pre-token and
+# concatenating them reproduces the input byte for byte, which
+# ``test_bpe.py`` asserts directly.
+_PRETOKEN_RE = re.compile(r" ?\w+| ?[^\s\w]+|\s+(?!\S)|\s+", re.UNICODE)
 
 
 def _pretokenize(text: str) -> list[str]:

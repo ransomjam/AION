@@ -8,7 +8,7 @@ Only the operations required by the current milestone are implemented here.
 New operations are added incrementally as future models require them — never
 speculatively.  The pattern is always the same:
 
-    1. Compute the forward value with NumPy.
+    1. Compute the forward value with the active array backend (``xp``).
     2. Determine whether any input requires a gradient.
     3. If so, build a ``Tensor`` with a ``_backward`` closure that captures the
        inputs and any intermediate values needed for the gradient computation.
@@ -30,6 +30,9 @@ embedding_lookup, reshape, log_softmax
 from __future__ import annotations
 
 import numpy as np
+
+from aion import backend
+from aion.backend import xp
 
 from .tensor import Tensor
 
@@ -65,7 +68,7 @@ def _accum(t: Tensor, g: np.ndarray) -> None:
     if not t.requires_grad:
         return
     if t.grad is None:
-        t.grad = np.zeros_like(t.data)
+        t.grad = xp.zeros_like(t.data)
     # Sum over any extra leading batch dimensions.
     while g.ndim > t.data.ndim:
         g = g.sum(axis=0)
@@ -132,13 +135,13 @@ def matmul(a: Tensor, b: Tensor) -> Tensor:
 
 def sum(a: Tensor, axis=None, keepdims: bool = False) -> Tensor:
     """Sum over ``axis`` (or all axes if None)."""
-    out = _make_out(np.sum(a.data, axis=axis, keepdims=keepdims), a.requires_grad)
+    out = _make_out(xp.sum(a.data, axis=axis, keepdims=keepdims), a.requires_grad)
     if a.requires_grad:
         def _backward() -> None:
             g = out.grad
             if not keepdims and axis is not None:
-                g = np.expand_dims(g, axis=axis)
-            _accum(a, np.broadcast_to(g, a.shape).copy())
+                g = xp.expand_dims(g, axis=axis)
+            _accum(a, xp.broadcast_to(g, a.shape).copy())
         out._backward = _backward
         out._inputs = (a,)
     return out
@@ -146,14 +149,14 @@ def sum(a: Tensor, axis=None, keepdims: bool = False) -> Tensor:
 
 def mean(a: Tensor, axis=None, keepdims: bool = False) -> Tensor:
     """Mean over ``axis`` (or all axes if None)."""
-    out = _make_out(np.mean(a.data, axis=axis, keepdims=keepdims), a.requires_grad)
+    out = _make_out(xp.mean(a.data, axis=axis, keepdims=keepdims), a.requires_grad)
     if a.requires_grad:
         n = a.data.size if axis is None else a.data.shape[axis]
         def _backward() -> None:
             g = out.grad
             if not keepdims and axis is not None:
-                g = np.expand_dims(g, axis=axis)
-            _accum(a, np.broadcast_to(g / n, a.shape).copy())
+                g = xp.expand_dims(g, axis=axis)
+            _accum(a, xp.broadcast_to(g / n, a.shape).copy())
         out._backward = _backward
         out._inputs = (a,)
     return out
@@ -172,7 +175,7 @@ def relu(a: Tensor) -> Tensor:
 
 
 def tanh(a: Tensor) -> Tensor:
-    t = np.tanh(a.data)
+    t = xp.tanh(a.data)
     out = _make_out(t, a.requires_grad)
     if a.requires_grad:
         def _backward() -> None:
@@ -183,7 +186,7 @@ def tanh(a: Tensor) -> Tensor:
 
 
 def sigmoid(a: Tensor) -> Tensor:
-    s = 1.0 / (1.0 + np.exp(-a.data))
+    s = 1.0 / (1.0 + xp.exp(-a.data))
     out = _make_out(s, a.requires_grad)
     if a.requires_grad:
         def _backward() -> None:
@@ -195,7 +198,7 @@ def sigmoid(a: Tensor) -> Tensor:
 
 def log(a: Tensor) -> Tensor:
     """Natural logarithm.  Inputs should be positive."""
-    out = _make_out(np.log(a.data), a.requires_grad)
+    out = _make_out(xp.log(a.data), a.requires_grad)
     if a.requires_grad:
         def _backward() -> None:
             _accum(a, out.grad / a.data)
@@ -205,7 +208,7 @@ def log(a: Tensor) -> Tensor:
 
 
 def exp(a: Tensor) -> Tensor:
-    e = np.exp(a.data)
+    e = xp.exp(a.data)
     out = _make_out(e, a.requires_grad)
     if a.requires_grad:
         def _backward() -> None:
@@ -229,17 +232,20 @@ def reshape(a: Tensor, shape: tuple) -> Tensor:
 def embedding_lookup(table: Tensor, ids: np.ndarray) -> Tensor:
     """Differentiable row-gather from an embedding table.
 
-    ``ids`` is a plain ``np.ndarray`` of integer indices — not a ``Tensor``
-    and not differentiable.  Gradients scatter-add back into the rows of
-    ``table`` that were selected.
+    ``ids`` is a plain integer array — not a ``Tensor`` and not
+    differentiable.  Token ids are produced and batched on the host; this is
+    where a batch of them crosses to the compute device, because indexing a
+    device array requires device indices.  Gradients scatter-add back into the
+    rows of ``table`` that were selected, and the scatter must accumulate
+    duplicates: a token appearing twice in a batch contributes twice.
     """
-    ids = np.asarray(ids, dtype=np.intp)
+    ids = backend.as_index(ids)
     out = _make_out(table.data[ids], table.requires_grad)
     if table.requires_grad:
         def _backward() -> None:
             if table.grad is None:
-                table.grad = np.zeros_like(table.data)
-            np.add.at(table.grad, ids, out.grad)
+                table.grad = xp.zeros_like(table.data)
+            backend.scatter_add(table.grad, ids, out.grad)
         out._backward = _backward
         out._inputs = (table,)
     return out
@@ -253,11 +259,11 @@ def log_softmax(a: Tensor, axis: int = -1) -> Tensor:
         grad_input = grad_output - softmax * sum(grad_output, axis)
     """
     shifted = a.data - a.data.max(axis=axis, keepdims=True)
-    log_sum_exp = np.log(np.exp(shifted).sum(axis=axis, keepdims=True))
+    log_sum_exp = xp.log(xp.exp(shifted).sum(axis=axis, keepdims=True))
     lsm = shifted - log_sum_exp
     out = _make_out(lsm, a.requires_grad)
     if a.requires_grad:
-        softmax = np.exp(lsm)
+        softmax = xp.exp(lsm)
         def _backward() -> None:
             g = out.grad
             _accum(a, g - softmax * g.sum(axis=axis, keepdims=True))
@@ -282,7 +288,7 @@ def softmax(a: Tensor, axis: int = -1) -> Tensor:
     softmax values, not from raw logits.
     """
     shifted = a.data - a.data.max(axis=axis, keepdims=True)
-    e = np.exp(shifted)
+    e = xp.exp(shifted)
     s = e / e.sum(axis=axis, keepdims=True)
     out = _make_out(s, a.requires_grad)
     if a.requires_grad:
@@ -300,11 +306,13 @@ def transpose(a: Tensor, axes: tuple) -> Tensor:
     The backward permutes the incoming gradient with the inverse permutation,
     restoring the original axis order.
     """
-    out = _make_out(np.transpose(a.data, axes), a.requires_grad)
+    out = _make_out(xp.transpose(a.data, axes), a.requires_grad)
     if a.requires_grad:
+        # ``axes`` is a Python tuple describing the permutation, not data —
+        # inverting it is host arithmetic on both devices.
         inv = tuple(int(i) for i in np.argsort(axes))
         def _backward() -> None:
-            _accum(a, np.transpose(out.grad, inv))
+            _accum(a, xp.transpose(out.grad, inv))
         out._backward = _backward
         out._inputs = (a,)
     return out
@@ -327,7 +335,7 @@ def gelu(a: Tensor) -> Tensor:
     x = a.data
     x3 = x ** 3
     inner = c * (x + 0.044715 * x3)
-    t = np.tanh(inner)
+    t = xp.tanh(inner)
     g_fwd = 0.5 * x * (1.0 + t)
     out = _make_out(g_fwd, a.requires_grad)
     if a.requires_grad:
@@ -373,7 +381,7 @@ def layer_norm(
     x = a.data
     mean_x = x.mean(axis=-1, keepdims=True)
     var_x = x.var(axis=-1, keepdims=True)
-    std_x = np.sqrt(var_x + eps)
+    std_x = xp.sqrt(var_x + eps)
     x_norm = (x - mean_x) / std_x
     out_data = gamma.data * x_norm + beta.data
     needs = _needs_grad(a, gamma, beta)
@@ -403,9 +411,11 @@ def layer_norm(
 def dropout_mask(a: Tensor, mask: np.ndarray, keep_prob: float) -> Tensor:
     """Apply a pre-sampled dropout mask and scale by ``1/keep_prob``.
 
-    ``mask`` is a plain ``np.ndarray`` of dtype bool — not a ``Tensor`` and
-    not differentiable.  The backward passes the gradient through kept
-    positions only, scaled by ``1/keep_prob``.
+    ``mask`` is a plain boolean array — not a ``Tensor`` and not
+    differentiable.  It is sampled on the host (so a seed means the same thing
+    on every device) and moved here, once, for both the forward and the
+    backward.  The backward passes the gradient through kept positions only,
+    scaled by ``1/keep_prob``.
 
     Parameters
     ----------
@@ -417,6 +427,7 @@ def dropout_mask(a: Tensor, mask: np.ndarray, keep_prob: float) -> Tensor:
         Fraction of units kept (``1 - dropout_rate``).
     """
     scale = 1.0 / keep_prob if keep_prob > 0.0 else 0.0
+    mask = backend.asarray(mask)
     out = _make_out(a.data * mask * scale, a.requires_grad)
     if a.requires_grad:
         def _backward() -> None:

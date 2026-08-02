@@ -15,6 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
+from aion import backend
 from aion.util import now_iso
 
 
@@ -63,7 +64,9 @@ class GPTCheckpoint:
         Path to the saved ``.npz`` file.
         """
         params = model.parameters()
-        arrays = {_param_key(i, p): p.data for i, p in enumerate(params)}
+        # Host copies keep the checkpoint device-neutral (see aion.backend).
+        arrays = {_param_key(i, p): backend.to_host(p.data)
+                  for i, p in enumerate(params)}
         npz_path = self.run_dir / f"checkpoint_{epoch}.npz"
         np.savez_compressed(str(npz_path), **arrays)
 
@@ -115,7 +118,7 @@ class GPTCheckpoint:
         for i, p in enumerate(model.parameters()):
             key = param_keys[i] if i < len(param_keys) else _param_key(i, p)
             if key in weights:
-                p.data = weights[key].astype(p.data.dtype)
+                p.data = backend.asarray(weights[key], dtype=p.data.dtype)
 
         if optimizer is not None and meta.get("optimizer") is not None:
             optim_path = self._optim_path(epoch)

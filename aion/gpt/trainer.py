@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from aion import backend
+from aion.backend import xp
 from aion.nn.optim import Optimizer
 
 from .loss import CausalLanguageModelLoss
@@ -132,11 +134,23 @@ def _rng_state(gen):
 
 
 def _global_grad_norm(model: GPTModel) -> float:
-    """Compute the global L2 norm of all parameter gradients."""
+    """Compute the global L2 norm of all parameter gradients.
+
+    Each parameter's squared sum is reduced on the compute device, then the
+    whole set is brought back in ONE transfer.  Reading them one at a time
+    would work, but on a GPU every ``float()`` is a synchronisation point, and
+    this runs on every step for every parameter — enough stalls to show up in
+    tokens/sec.  The per-parameter reduction dtype and the host-side
+    accumulation order are unchanged, so the value is identical to reading
+    them individually.
+    """
+    squares = [xp.sum(p.grad ** 2) for p in model.parameters()
+               if p.grad is not None]
+    if not squares:
+        return 0.0
     total = 0.0
-    for p in model.parameters():
-        if p.grad is not None:
-            total += float(np.sum(p.grad ** 2))
+    for s in backend.to_host(xp.stack(squares)):
+        total += float(s)
     return math.sqrt(total)
 
 
@@ -290,7 +304,7 @@ class GPTTrainer:
         data_rng_epoch_state = _rng_state(data_rng)  # snapshot before epoch loop
 
         def _do_checkpoint(reason: str, epoch: int, batch_in_epoch: int,
-                           data_state) -> None:
+                           data_state, tokens_seen: int | None = None) -> None:
             nonlocal last_ckpt_t
             if checkpoint_fn is None:
                 return
@@ -303,7 +317,10 @@ class GPTTrainer:
                 # RNG state at the START of the epoch the resume will begin, so
                 # the shuffle (and thus batch order) replays identically.
                 "data_rng_epoch_state": data_state,
-                "tokens_processed": total_tokens,
+                # ``total_tokens`` only advances at the epoch boundary, so a
+                # mid-epoch checkpoint that read it alone would always record 0.
+                # Callers inside the loop pass the running total explicitly.
+                "tokens_processed": total_tokens if tokens_seen is None else tokens_seen,
                 "history": {
                     "loss_history": list(loss_history),
                     "val_loss_history": list(val_loss_history),
@@ -316,6 +333,13 @@ class GPTTrainer:
 
         epoch = start_epoch
         n_batches = 0
+        # Absolute position within the current epoch, in the epoch's own batch
+        # numbering.  Distinct from ``n_batches`` (which counts only what THIS
+        # process ran) and the only value that is correct to checkpoint.
+        batch_in_epoch = start_batch_in_epoch
+        # Initialised here too, so the KeyboardInterrupt handler can always read
+        # them even if the interrupt lands before the first epoch body runs.
+        epoch_tokens = 0
         try:
           for epoch in range(start_epoch, start_epoch + epochs):
             self.model.train()
@@ -330,6 +354,7 @@ class GPTTrainer:
             data_rng_epoch_state = _rng_state(data_rng)
             # On the first (resumed) epoch, skip batches already completed.
             skip = start_batch_in_epoch if epoch == start_epoch else 0
+            batch_in_epoch = skip
 
             self._callbacks.on_epoch_begin(self, {"epoch": epoch, "epochs": total_epochs})
             logger.info(
@@ -377,9 +402,10 @@ class GPTTrainer:
                     logger.info("First optimizer step done in %.2fs", time.monotonic() - _t)
                 global_step += 1
 
+                batch_in_epoch = batch_i + 1
                 batch_tokens = int(np.prod(x_ids.shape))
                 epoch_tokens += batch_tokens
-                step_loss = float(loss.data.flat[0])
+                step_loss = loss.item()
                 epoch_loss += step_loss
                 epoch_norm += norm
                 n_batches += 1
@@ -419,11 +445,22 @@ class GPTTrainer:
 
                 # ── step / wall-clock checkpoint triggers ──────────────────────
                 # Mid-epoch: resume replays THIS epoch, so save its start state.
+                #
+                # ``batch_in_epoch`` must be the ABSOLUTE position in the epoch
+                # (batch_i + 1), not ``n_batches``.  ``n_batches`` resets to 0
+                # each epoch and counts only the batches this PROCESS executed,
+                # so on a resumed run it is short by exactly ``skip`` — and the
+                # next resume would then replay those ``skip`` batches, training
+                # on them twice and breaking the "resumes identically to an
+                # uninterrupted run" guarantee.  The two are equal only on a
+                # fresh run, which is why this survived until a second resume.
                 if checkpoint_every_n_steps and global_step % checkpoint_every_n_steps == 0:
-                    _do_checkpoint("step_interval", epoch, n_batches, data_rng_epoch_state)
+                    _do_checkpoint("step_interval", epoch, batch_in_epoch,
+                                   data_rng_epoch_state, total_tokens + epoch_tokens)
                 elif (checkpoint_every_minutes
                       and (time.monotonic() - last_ckpt_t) >= checkpoint_every_minutes * 60):
-                    _do_checkpoint("minutes", epoch, n_batches, data_rng_epoch_state)
+                    _do_checkpoint("minutes", epoch, batch_in_epoch,
+                                   data_rng_epoch_state, total_tokens + epoch_tokens)
 
             total_tokens += epoch_tokens
             elapsed = time.monotonic() - t_epoch
@@ -484,7 +521,8 @@ class GPTTrainer:
             # so the caller can report and exit cleanly.  Mid-epoch => replay this
             # epoch, so save its start state.
             logger.warning("KeyboardInterrupt received — saving final checkpoint...")
-            _do_checkpoint("interrupt", epoch, n_batches, data_rng_epoch_state)
+            _do_checkpoint("interrupt", epoch, batch_in_epoch, data_rng_epoch_state,
+                           total_tokens + epoch_tokens)
             raise
 
         training_time = time.monotonic() - t_total
@@ -523,7 +561,7 @@ class GPTTrainer:
         for x_ids, y_ids in batches:
             logits, _ = self.model(x_ids)
             loss = self._loss_fn(logits, y_ids)
-            total_loss += float(loss.data.flat[0])
+            total_loss += loss.item()
             n_batches += 1
         mean_loss = total_loss / max(1, n_batches)
         perplexity = math.exp(min(mean_loss, 500.0))  # cap to avoid overflow

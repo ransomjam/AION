@@ -77,9 +77,47 @@ aion/
                   (the training + inference input path).  ← implemented
   datasets/       Data Lab library: dataset storage + statistics + quality +
                   search (project-scoped, reuses the tokenizer).  ← implemented
+  backend.py      the compute device: NumPy on CPU, CuPy on CUDA, selected
+                  once by AION_DEVICE.  ← implemented
   app/            the operating environment: stdlib server, Lab Registry,
                   zero-build web UI over every capability.  ← implemented
 ```
+
+## Compute devices
+
+Training runs on the CPU by default and on an NVIDIA GPU when asked:
+
+```
+AION_DEVICE=cuda python scripts/train_aion_cyber.py --preset gpu
+```
+
+The device is chosen once at import time, before any tensor exists, because a
+single process cannot hold half a graph on each device. RNG, token ids, and
+everything written to disk stay on the host, which is what makes a seed mean
+the same thing on both devices and a checkpoint loadable on either.
+
+CPU and GPU are **not** bit-identical to each other — cuBLAS and OpenBLAS
+reduce in different orders. Bit-identity is guaranteed per device.
+`scripts/gpu_smoke.py --compare` measures the agreement rather than assuming
+it, and should be run on any new machine before a long job.
+
+## AION-Cyber
+
+A cybersecurity corpus built from public, redistributable sources — NVD CVE
+records, the CISA Known Exploited Vulnerabilities catalogue, MITRE ATT&CK,
+OWASP — plus generated threat-reasoning examples that teach the *shape* of an
+analysis rather than a list of facts. Every document carries its licence and a
+`genuine` or `synthetic` provenance label; nothing merges the two.
+
+```
+python scripts/build_cyber_corpus.py --report-only        # see what it would collect
+python scripts/build_cyber_corpus.py --max-cves 60000     # build it
+python scripts/train_tokenizer.py --datasets aion-corpus aion-cyber --retrain
+python scripts/train_aion_cyber.py                        # train on the mix
+```
+
+To train it on rented hardware and bring the model back, follow
+[docs/runbooks/runpod-training.md](docs/runbooks/runpod-training.md).
 
 Planned, in dependency order (see [docs/vision/roadmap.md](docs/vision/roadmap.md)):
 subword tokenizer training (BPE) · dataset versioning · training pipeline ·

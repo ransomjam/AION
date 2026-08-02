@@ -18,6 +18,9 @@ from __future__ import annotations
 
 import numpy as np
 
+from aion import backend
+from aion.backend import xp
+
 from .module import Module
 from .ops import log_softmax
 from .tensor import Tensor
@@ -38,20 +41,23 @@ class CrossEntropyLoss(Module):
     """
 
     def forward(self, predictions: Tensor, targets) -> Tensor:  # type: ignore[override]
-        targets = np.asarray(targets, dtype=np.intp)
+        batch = np.asarray(targets, dtype=np.intp).shape[0]
         lsm = log_softmax(predictions, axis=-1)
-        batch = targets.shape[0]
-        nll_data = -lsm.data[np.arange(batch), targets]
+        # Row and column indices must live wherever the logits live: one pair
+        # of index arrays, built once and reused by the backward closure.
+        rows = backend.as_index(np.arange(batch))
+        cols = backend.as_index(targets)
+        nll_data = -lsm.data[rows, cols]
         loss_val = nll_data.mean()
 
-        out = Tensor(np.array(loss_val))
+        out = Tensor(loss_val)
         if lsm.requires_grad:
             out.requires_grad = True
             def _backward() -> None:
-                g = np.zeros_like(lsm.data)
-                g[np.arange(batch), targets] = -1.0 / batch
+                g = xp.zeros_like(lsm.data)
+                g[rows, cols] = -1.0 / batch
                 if lsm.grad is None:
-                    lsm.grad = np.zeros_like(lsm.data)
+                    lsm.grad = xp.zeros_like(lsm.data)
                 lsm.grad += out.grad * g
             out._backward = _backward
             out._inputs = (lsm,)
@@ -70,18 +76,18 @@ class MSELoss(Module):
     """
 
     def forward(self, predictions: Tensor, targets) -> Tensor:  # type: ignore[override]
-        targets = np.asarray(targets, dtype=np.float64)
+        targets = backend.asarray(targets, dtype=np.float64)
         diff_data = predictions.data - targets
-        loss_val = np.mean(diff_data ** 2)
+        loss_val = xp.mean(diff_data ** 2)
         n = predictions.data.size
 
-        out = Tensor(np.array(loss_val))
+        out = Tensor(loss_val)
         if predictions.requires_grad:
             out.requires_grad = True
             def _backward() -> None:
                 g = out.grad * (2.0 / n) * diff_data
                 if predictions.grad is None:
-                    predictions.grad = np.zeros_like(predictions.data)
+                    predictions.grad = xp.zeros_like(predictions.data)
                 predictions.grad += g
             out._backward = _backward
             out._inputs = (predictions,)
@@ -105,20 +111,20 @@ class BCELoss(Module):
     _EPS = 1e-12
 
     def forward(self, predictions: Tensor, targets) -> Tensor:  # type: ignore[override]
-        targets = np.asarray(targets, dtype=np.float64)
-        p = np.clip(predictions.data, self._EPS, 1.0 - self._EPS)
-        loss_val = -np.mean(
-            targets * np.log(p) + (1.0 - targets) * np.log(1.0 - p)
+        targets = backend.asarray(targets, dtype=np.float64)
+        p = xp.clip(predictions.data, self._EPS, 1.0 - self._EPS)
+        loss_val = -xp.mean(
+            targets * xp.log(p) + (1.0 - targets) * xp.log(1.0 - p)
         )
         n = predictions.data.size
 
-        out = Tensor(np.array(loss_val))
+        out = Tensor(loss_val)
         if predictions.requires_grad:
             out.requires_grad = True
             def _backward() -> None:
                 g = out.grad * (-(targets / p) + (1.0 - targets) / (1.0 - p)) / n
                 if predictions.grad is None:
-                    predictions.grad = np.zeros_like(predictions.data)
+                    predictions.grad = xp.zeros_like(predictions.data)
                 predictions.grad += g
             out._backward = _backward
             out._inputs = (predictions,)

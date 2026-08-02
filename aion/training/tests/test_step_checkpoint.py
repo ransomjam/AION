@@ -219,6 +219,88 @@ class TestResumeContinuity(unittest.TestCase):
             msg=f"resumed weights differ (max|Δ|={np.max(np.abs(W_full-W_resumed)):.2e})",
         )
 
+    def test_second_resume_does_not_replay_batches(self):
+        """A resumed run must checkpoint its ABSOLUTE position in the epoch.
+
+        Regression test.  ``batch_in_epoch`` used to be written from
+        ``n_batches``, which resets each epoch and counts only the batches the
+        CURRENT process ran.  On a fresh run the two agree, so this went
+        unnoticed; on a resumed run the checkpointed value was short by exactly
+        the number of skipped batches, and the *next* resume replayed them —
+        training on the same data twice and silently breaking the bit-identical
+        guarantee.
+
+        The real artifact showed it plainly: global_step 6423 recorded
+        batch_in_epoch 6154, a gap of 269, which was precisely the step the run
+        had been resumed from.
+        """
+        tmp = tempfile.mkdtemp(prefix="aion_resume2_")
+        mgr = StepCheckpointManager(Path(tmp), "run_test", keep_last_n=20)
+
+        # (1) fresh run, interrupted at step 3
+        _, model, opt = _build_model()
+        rng = np.random.default_rng(43)
+        ckfn = _make_ckpt_fn(mgr, model, opt,
+                             np.random.default_rng(42), np.random.default_rng(44))
+        trainer = GPTTrainer(model, opt, grad_clip=1.0, callbacks=[_InterruptAt(3)])
+        with self.assertRaises(KeyboardInterrupt):
+            trainer.train(_make_sampler(rng), epochs=3, total_epochs=3, data_rng=rng,
+                          checkpoint_fn=ckfn, checkpoint_every_n_steps=1000)
+        first = mgr.load_latest()
+        self.assertEqual(first.global_step, 3)
+        self.assertEqual(first.batch_in_epoch, 3)
+
+        # (2) resume, run further, get interrupted AGAIN at step 7
+        _, model2, opt2 = _build_model()
+        StepCheckpointManager.restore_model(model2, first)
+        StepCheckpointManager.restore_optimizer(opt2, first)
+        rng2 = np.random.default_rng(43)
+        rng2.bit_generator.state = first.state["rng"]["data_epoch_start"]
+        ckfn2 = _make_ckpt_fn(mgr, model2, opt2,
+                              np.random.default_rng(42), np.random.default_rng(44))
+        trainer2 = GPTTrainer(model2, opt2, grad_clip=1.0, callbacks=[_InterruptAt(7)])
+        with self.assertRaises(KeyboardInterrupt):
+            trainer2.train(_make_sampler(rng2), epochs=3 - first.epoch, total_epochs=3,
+                           start_epoch=first.epoch, start_step=first.global_step,
+                           start_batch_in_epoch=first.batch_in_epoch, data_rng=rng2,
+                           checkpoint_fn=ckfn2, checkpoint_every_n_steps=1000,
+                           history=first.state["history"])
+
+        second = mgr.load_latest()
+        self.assertEqual(second.global_step, 7)
+        # THE ASSERTION: within one epoch, position in the epoch tracks the
+        # global step.  The old code wrote 4 here (7 - 3 skipped) and the third
+        # resume would have retrained batches 4..7.
+        self.assertEqual(
+            second.batch_in_epoch, 7,
+            f"checkpoint at global_step 7 recorded batch_in_epoch "
+            f"{second.batch_in_epoch}; a further resume would replay "
+            f"{7 - second.batch_in_epoch} batches",
+        )
+
+    def test_mid_epoch_checkpoint_records_tokens_processed(self):
+        """``tokens_processed`` used to be 0 in every mid-epoch checkpoint.
+
+        ``total_tokens`` only advances at the epoch boundary, so a checkpoint
+        taken inside an epoch reported that no tokens had been seen — making the
+        field useless exactly where it matters, on a long interrupted run.
+        """
+        tmp = tempfile.mkdtemp(prefix="aion_tokens_")
+        mgr = StepCheckpointManager(Path(tmp), "run_test", keep_last_n=10)
+        _, model, opt = _build_model()
+        rng = np.random.default_rng(43)
+        ckfn = _make_ckpt_fn(mgr, model, opt,
+                             np.random.default_rng(42), np.random.default_rng(44))
+        trainer = GPTTrainer(model, opt, grad_clip=1.0, callbacks=[_InterruptAt(5)])
+        with self.assertRaises(KeyboardInterrupt):
+            trainer.train(_make_sampler(rng), epochs=3, total_epochs=3, data_rng=rng,
+                          checkpoint_fn=ckfn, checkpoint_every_n_steps=2)
+
+        loaded = mgr.load_latest()
+        # 5 steps x batch 4 x block 8 = 160 tokens seen before the interrupt.
+        self.assertGreater(loaded.state["tokens_processed"], 0,
+                           "mid-epoch checkpoint recorded zero tokens processed")
+
     def test_scheduler_resumes(self):
         # LR is a pure function of global_step; restoring the step restores the
         # schedule.  Verify the resumed schedule matches the uninterrupted one.

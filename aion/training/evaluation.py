@@ -66,7 +66,7 @@ class EvaluationRunner:
                 break
             logits, _ = self.model(x_ids)
             loss = self._loss_fn(logits, y_ids)
-            total_loss += float(loss.data.flat[0])
+            total_loss += loss.item()
             n_batches += 1
 
         self.model.train()

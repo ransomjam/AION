@@ -24,6 +24,7 @@ from pathlib import Path
 
 import numpy as np
 
+from aion import backend
 from aion.util import code_version, fingerprint, now_iso, slugify
 
 ARCHITECTURE = "gpt-v1"
@@ -90,7 +91,11 @@ class GPTStore:
 
         # ── weights.npz ───────────────────────────────────────────────────────
         all_params = model.parameters()
-        weight_arrays = {_param_key(i, p): p.data for i, p in enumerate(all_params)}
+        # Host copies: a saved model is device-neutral.  Weights trained on a
+        # GPU pod load into a CPU process unchanged, which is what makes
+        # "train remotely, run locally" a copy rather than a conversion.
+        weight_arrays = {_param_key(i, p): backend.to_host(p.data)
+                         for i, p in enumerate(all_params)}
         np.savez_compressed(str(model_dir / "weights.npz"), **weight_arrays)
 
         # ── architecture.json ─────────────────────────────────────────────────
@@ -179,7 +184,7 @@ class GPTStore:
         for i, p in enumerate(model.parameters()):
             key = param_keys[i] if i < len(param_keys) else _param_key(i, p)
             if key in weights:
-                p.data = weights[key].astype(p.data.dtype)
+                p.data = backend.asarray(weights[key], dtype=p.data.dtype)
 
         return model
 

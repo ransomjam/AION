@@ -247,16 +247,29 @@ class MultiHeadAttention(Module):
         K_flat = reshape(K_h, (batch * H, seq_k, D))
         V_flat = reshape(V_h, (batch * H, seq_k, D))
 
-        # Expand mask bias from [batch, 1, 1, seq_k] or [1, 1, seq_q, seq_k]
-        # to [batch*n_heads, seq_q, seq_k] so it broadcasts over the flat batch.
+        # Expand the mask bias so it broadcasts over the flattened batch*head
+        # axis.  A [1, seq_q, seq_k] bias broadcasts over [batch*H, ...] on its
+        # own, so a mask that is identical for every batch element and head — a
+        # causal mask, the only kind a decoder uses — needs no expansion at all.
+        #
+        # Materialising it was expensive out of proportion to its content: it is
+        # a constant triangle, but `broadcast_to(...).reshape(...)` forces a real
+        # [batch*H, seq_q, seq_k] array, which is then copied host-to-device once
+        # per layer per step.  At batch 64, seq 512, 6 layers that is 3.2 GB of
+        # PCIe traffic every step — more wall-clock than the arithmetic it feeds.
         flat_mask = None
         if mask is not None:
             bias_4d = mask.bias(seq_q, seq_k, batch_size=batch)  # [b,1,1,sk] or [1,1,sq,sk]
-            # Broadcast to [batch, n_heads, seq_q, seq_k] then flatten.
-            bias_full = np.broadcast_to(
-                bias_4d, (batch, H, seq_q, seq_k)
-            ).reshape(batch * H, seq_q, seq_k)
-            flat_mask = _PrecomputedMask(bias_full)
+            if bias_4d.shape[0] == 1:
+                # Same for every batch element (causal): drop the leading axes and
+                # let broadcasting do the rest.  No copy, no per-layer transfer.
+                bias_flat = bias_4d.reshape(1, bias_4d.shape[2], bias_4d.shape[3])
+            else:
+                # Per-sample (padding mask): genuinely varies, so expand it.
+                bias_flat = np.broadcast_to(
+                    bias_4d, (batch, H, seq_q, seq_k)
+                ).reshape(batch * H, seq_q, seq_k)
+            flat_mask = _PrecomputedMask(bias_flat)
 
         out_flat, w_flat = self._sdpa(Q_flat, K_flat, V_flat, flat_mask)
         # out_flat: [batch*n_heads, seq_q, d_head]
@@ -265,8 +278,19 @@ class MultiHeadAttention(Module):
         # Collect weights (detached) before reshaping.
         all_weights = w_flat.data.copy().reshape(batch, H, seq_q, seq_k)
 
-        # Merge heads: [batch*n_heads, seq_q, d_head] → [batch, seq_q, d_model]
-        out_merged = reshape(out_flat, (batch, seq_q, self.d_model))
+        # Merge heads: [batch*n_heads, seq_q, d_head] → [batch, seq_q, d_model].
+        #
+        # This MUST mirror _split_heads exactly, transpose included.  A direct
+        # reshape from [batch*H, seq_q, D] to [batch, seq_q, d_model] is not the
+        # inverse of the split: it reinterprets the (head, position) axes as
+        # (position, head), so output position i ends up reading head 0 at
+        # positions i..i+H-1.  That silently destroys the head structure AND
+        # leaks future positions past the causal mask, which makes the model
+        # score well during teacher-forced training and generate nonsense at
+        # inference.  See test_causal_integrity.py.
+        out_h = reshape(out_flat, (batch, H, seq_q, D))       # unflatten heads
+        out_t = transpose(out_h, (0, 2, 1, 3))                # [batch, seq_q, H, D]
+        out_merged = reshape(out_t, (batch, seq_q, self.d_model))
 
         # Output projection.
         output = matmul(out_merged, self.W_O)

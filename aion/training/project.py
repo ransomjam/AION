@@ -593,7 +593,10 @@ class TrainingProject:
             dataset_fingerprint=corpus.fingerprint.combined,
             tokenizer_id=cfg.tokenizer_id,
             tokenizer_fingerprint=tok_fp,
-            params={"training_config": cfg.to_dict()},
+            # ``run_id`` closes the loop from a saved model back to the logs,
+            # metrics, and checkpoints that produced it.  Without it a model is
+            # traceable to its data and code but not to its own run.
+            params={"training_config": cfg.to_dict(), "run_id": run_id},
         )
         model_id = model_manifest["id"]
         logger.info("Model saved as %s in %.2fs", model_id, time.monotonic() - t_stage)
